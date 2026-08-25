@@ -15,6 +15,19 @@ pub enum PrefixKey {
     CtrlX,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptType {
+    SaveAs,
+}
+
+#[derive(Debug, Clone)]
+pub struct PromptState {
+    pub prompt_type: PromptType,
+    pub label: String,
+    pub input: String,
+    pub cursor: usize,
+}
+
 pub struct Editor {
     pub buffer: Buffer,
     pub cursor_row: usize,
@@ -22,6 +35,7 @@ pub struct Editor {
     pub scroll_row: usize,
     pub scroll_col: usize,
     pub prefix: PrefixKey,
+    pub prompt: Option<PromptState>,
     pub message: Option<String>,
     pub should_quit: bool,
 }
@@ -35,7 +49,10 @@ impl Editor {
             scroll_row: 0,
             scroll_col: 0,
             prefix: PrefixKey::None,
-            message: Some("Welcome to Relic! (C-x C-s: Save, C-x C-c: Quit, C-g: Cancel)".into()),
+            prompt: None,
+            message: Some(
+                "Welcome to Relic! (C-x C-s: Save, C-x C-w: Write file, C-x C-c: Quit)".into(),
+            ),
             should_quit: false,
         }
     }
@@ -43,6 +60,13 @@ impl Editor {
     pub fn handle_key_event(&mut self, key: KeyEvent) {
         let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
+        // 1. If currently inside a Minibuffer prompt
+        if self.prompt.is_some() {
+            self.handle_prompt_key(key, is_ctrl);
+            return;
+        }
+
+        // 2. Normal Editor key handling
         match self.prefix {
             PrefixKey::None => {
                 if is_ctrl {
@@ -94,7 +118,8 @@ impl Editor {
                 self.prefix = PrefixKey::None;
                 if is_ctrl {
                     match key.code {
-                        KeyCode::Char('s') => self.save_file(),
+                        KeyCode::Char('s') => self.request_save(),
+                        KeyCode::Char('w') => self.request_write_file(),
                         KeyCode::Char('c') => self.should_quit = true,
                         KeyCode::Char('g') => {
                             self.message = Some("Quit".into());
@@ -111,7 +136,8 @@ impl Editor {
                     }
                 } else {
                     match key.code {
-                        KeyCode::Char('s') => self.save_file(),
+                        KeyCode::Char('s') => self.request_save(),
+                        KeyCode::Char('w') => self.request_write_file(),
                         KeyCode::Char('c') => self.should_quit = true,
                         KeyCode::Char('g') | KeyCode::Esc => {
                             self.message = Some("Quit".into());
@@ -129,6 +155,158 @@ impl Editor {
                 }
             }
         }
+    }
+
+    fn handle_prompt_key(&mut self, key: KeyEvent, is_ctrl: bool) {
+        if is_ctrl {
+            match key.code {
+                KeyCode::Char('g') => {
+                    self.prompt = None;
+                    self.message = Some("Quit".into());
+                }
+                KeyCode::Char('h') => {
+                    self.prompt_backspace();
+                }
+                KeyCode::Char('a') => {
+                    if let Some(ref mut p) = self.prompt {
+                        p.cursor = 0;
+                    }
+                }
+                KeyCode::Char('e') => {
+                    if let Some(ref mut p) = self.prompt {
+                        p.cursor = p.input.chars().count();
+                    }
+                }
+                KeyCode::Char('b') => {
+                    self.prompt_move_left();
+                }
+                KeyCode::Char('f') => {
+                    self.prompt_move_right();
+                }
+                _ => {}
+            }
+        } else {
+            match key.code {
+                KeyCode::Enter => {
+                    self.confirm_prompt();
+                }
+                KeyCode::Esc => {
+                    self.prompt = None;
+                    self.message = Some("Quit".into());
+                }
+                KeyCode::Backspace => {
+                    self.prompt_backspace();
+                }
+                KeyCode::Left => {
+                    self.prompt_move_left();
+                }
+                KeyCode::Right => {
+                    self.prompt_move_right();
+                }
+                KeyCode::Home => {
+                    if let Some(ref mut p) = self.prompt {
+                        p.cursor = 0;
+                    }
+                }
+                KeyCode::End => {
+                    if let Some(ref mut p) = self.prompt {
+                        p.cursor = p.input.chars().count();
+                    }
+                }
+                KeyCode::Char(c) => {
+                    self.prompt_insert_char(c);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn prompt_move_left(&mut self) {
+        if let Some(ref mut p) = self.prompt {
+            p.cursor = p.cursor.saturating_sub(1);
+        }
+    }
+
+    fn prompt_move_right(&mut self) {
+        if let Some(ref mut p) = self.prompt {
+            let max = p.input.chars().count();
+            if p.cursor < max {
+                p.cursor += 1;
+            }
+        }
+    }
+
+    fn prompt_insert_char(&mut self, c: char) {
+        if let Some(ref mut p) = self.prompt {
+            let mut chars: Vec<char> = p.input.chars().collect();
+            chars.insert(p.cursor, c);
+            p.input = chars.into_iter().collect();
+            p.cursor += 1;
+        }
+    }
+
+    fn prompt_backspace(&mut self) {
+        if let Some(ref mut p) = self.prompt
+            && p.cursor > 0
+        {
+            let mut chars: Vec<char> = p.input.chars().collect();
+            chars.remove(p.cursor - 1);
+            p.input = chars.into_iter().collect();
+            p.cursor -= 1;
+        }
+    }
+
+    fn confirm_prompt(&mut self) {
+        if let Some(prompt) = self.prompt.take() {
+            match prompt.prompt_type {
+                PromptType::SaveAs => {
+                    let trimmed = prompt.input.trim();
+                    if trimmed.is_empty() {
+                        self.message = Some("No file name specified".into());
+                    } else {
+                        match self.buffer.save_to(trimmed) {
+                            Ok(()) => {
+                                self.message = Some(format!("Wrote {}", trimmed));
+                            }
+                            Err(e) => {
+                                self.message = Some(format!("Error saving file: {}", e));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn request_save(&mut self) {
+        if self.buffer.path.is_some() {
+            self.save_file();
+        } else {
+            self.prompt = Some(PromptState {
+                prompt_type: PromptType::SaveAs,
+                label: "Save file as: ".into(),
+                input: String::new(),
+                cursor: 0,
+            });
+            self.message = None;
+        }
+    }
+
+    pub fn request_write_file(&mut self) {
+        let default_input = self
+            .buffer
+            .path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let len = default_input.chars().count();
+        self.prompt = Some(PromptState {
+            prompt_type: PromptType::SaveAs,
+            label: "Write file: ".into(),
+            input: default_input,
+            cursor: len,
+        });
+        self.message = None;
     }
 
     pub fn save_file(&mut self) {
@@ -341,21 +519,41 @@ impl Editor {
         frame.render_widget(status_widget, status_area);
 
         // 3. Message Area (Echo area / Minibuffer)
-        let msg_text = self.message.as_deref().unwrap_or("");
-        let msg_widget = Paragraph::new(msg_text).style(Style::default().fg(Color::Yellow));
-        frame.render_widget(msg_widget, message_area);
+        if let Some(ref prompt) = self.prompt {
+            let prompt_line = Line::from(vec![
+                Span::styled(
+                    &prompt.label,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(&prompt.input),
+            ]);
+            let prompt_widget = Paragraph::new(prompt_line);
+            frame.render_widget(prompt_widget, message_area);
 
-        // 4. Cursor Position
-        let screen_cursor_x = text_area.x
-            + gutter_width as u16
-            + (self.cursor_col.saturating_sub(self.scroll_col) as u16);
-        let screen_cursor_y =
-            text_area.y + (self.cursor_row.saturating_sub(self.scroll_row) as u16);
+            // Cursor in Minibuffer prompt
+            let prompt_cursor_x = message_area.x + prompt.label.len() as u16 + prompt.cursor as u16;
+            if prompt_cursor_x < message_area.x + message_area.width {
+                frame.set_cursor_position(Position::new(prompt_cursor_x, message_area.y));
+            }
+        } else {
+            let msg_text = self.message.as_deref().unwrap_or("");
+            let msg_widget = Paragraph::new(msg_text).style(Style::default().fg(Color::Yellow));
+            frame.render_widget(msg_widget, message_area);
 
-        if screen_cursor_x < text_area.x + text_area.width
-            && screen_cursor_y < text_area.y + text_area.height
-        {
-            frame.set_cursor_position(Position::new(screen_cursor_x, screen_cursor_y));
+            // 4. Cursor Position in Text Area
+            let screen_cursor_x = text_area.x
+                + gutter_width as u16
+                + (self.cursor_col.saturating_sub(self.scroll_col) as u16);
+            let screen_cursor_y =
+                text_area.y + (self.cursor_row.saturating_sub(self.scroll_row) as u16);
+
+            if screen_cursor_x < text_area.x + text_area.width
+                && screen_cursor_y < text_area.y + text_area.height
+            {
+                frame.set_cursor_position(Position::new(screen_cursor_x, screen_cursor_y));
+            }
         }
     }
 }

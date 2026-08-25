@@ -51,6 +51,15 @@ impl Buffer {
         }
     }
 
+    pub fn save_to<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
+        let path_buf = path.as_ref().to_path_buf();
+        let file = File::create(&path_buf)?;
+        self.rope.write_to(BufWriter::new(file))?;
+        self.path = Some(path_buf);
+        self.is_modified = false;
+        Ok(())
+    }
+
     pub fn len_lines(&self) -> usize {
         let count = self.rope.len_lines();
         if count == 0 { 1 } else { count }
