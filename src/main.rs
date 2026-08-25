@@ -1,4 +1,5 @@
 mod buffer;
+mod completion;
 mod editor;
 
 use std::env;

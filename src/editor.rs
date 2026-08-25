@@ -8,6 +8,7 @@ use ratatui::{
 };
 
 use crate::buffer::Buffer;
+use crate::completion::complete_path;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PrefixKey {
@@ -26,6 +27,7 @@ pub struct PromptState {
     pub label: String,
     pub input: String,
     pub cursor: usize,
+    pub completions_hint: Option<String>,
 }
 
 pub struct Editor {
@@ -170,11 +172,13 @@ impl Editor {
                 KeyCode::Char('a') => {
                     if let Some(ref mut p) = self.prompt {
                         p.cursor = 0;
+                        p.completions_hint = None;
                     }
                 }
                 KeyCode::Char('e') => {
                     if let Some(ref mut p) = self.prompt {
                         p.cursor = p.input.chars().count();
+                        p.completions_hint = None;
                     }
                 }
                 KeyCode::Char('b') => {
@@ -187,6 +191,9 @@ impl Editor {
             }
         } else {
             match key.code {
+                KeyCode::Tab => {
+                    self.prompt_complete();
+                }
                 KeyCode::Enter => {
                     self.confirm_prompt();
                 }
@@ -206,11 +213,13 @@ impl Editor {
                 KeyCode::Home => {
                     if let Some(ref mut p) = self.prompt {
                         p.cursor = 0;
+                        p.completions_hint = None;
                     }
                 }
                 KeyCode::End => {
                     if let Some(ref mut p) = self.prompt {
                         p.cursor = p.input.chars().count();
+                        p.completions_hint = None;
                     }
                 }
                 KeyCode::Char(c) => {
@@ -221,9 +230,29 @@ impl Editor {
         }
     }
 
+    fn prompt_complete(&mut self) {
+        if let Some(ref mut p) = self.prompt {
+            let res = complete_path(&p.input);
+            if let Some(completed) = res.completed {
+                p.input = completed;
+                p.cursor = p.input.chars().count();
+            }
+
+            if res.candidates.is_empty() {
+                p.completions_hint = Some("[No match]".into());
+            } else if res.candidates.len() == 1 {
+                p.completions_hint = Some("[Sole completion]".into());
+            } else {
+                let preview = res.candidates.join("  ");
+                p.completions_hint = Some(format!("[{}]", preview));
+            }
+        }
+    }
+
     fn prompt_move_left(&mut self) {
         if let Some(ref mut p) = self.prompt {
             p.cursor = p.cursor.saturating_sub(1);
+            p.completions_hint = None;
         }
     }
 
@@ -233,6 +262,7 @@ impl Editor {
             if p.cursor < max {
                 p.cursor += 1;
             }
+            p.completions_hint = None;
         }
     }
 
@@ -242,6 +272,7 @@ impl Editor {
             chars.insert(p.cursor, c);
             p.input = chars.into_iter().collect();
             p.cursor += 1;
+            p.completions_hint = None;
         }
     }
 
@@ -253,6 +284,7 @@ impl Editor {
             chars.remove(p.cursor - 1);
             p.input = chars.into_iter().collect();
             p.cursor -= 1;
+            p.completions_hint = None;
         }
     }
 
@@ -287,6 +319,7 @@ impl Editor {
                 label: "Save file as: ".into(),
                 input: String::new(),
                 cursor: 0,
+                completions_hint: None,
             });
             self.message = None;
         }
@@ -305,6 +338,7 @@ impl Editor {
             label: "Write file: ".into(),
             input: default_input,
             cursor: len,
+            completions_hint: None,
         });
         self.message = None;
     }
@@ -520,7 +554,7 @@ impl Editor {
 
         // 3. Message Area (Echo area / Minibuffer)
         if let Some(ref prompt) = self.prompt {
-            let prompt_line = Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     &prompt.label,
                     Style::default()
@@ -528,7 +562,16 @@ impl Editor {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(&prompt.input),
-            ]);
+            ];
+
+            if let Some(ref hint) = prompt.completions_hint {
+                spans.push(Span::styled(
+                    format!("  {}", hint),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+
+            let prompt_line = Line::from(spans);
             let prompt_widget = Paragraph::new(prompt_line);
             frame.render_widget(prompt_widget, message_area);
 
