@@ -1,0 +1,361 @@
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::{
+    Frame,
+    layout::{Constraint, Layout, Position},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Paragraph},
+};
+
+use crate::buffer::Buffer;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PrefixKey {
+    None,
+    CtrlX,
+}
+
+pub struct Editor {
+    pub buffer: Buffer,
+    pub cursor_row: usize,
+    pub cursor_col: usize,
+    pub scroll_row: usize,
+    pub scroll_col: usize,
+    pub prefix: PrefixKey,
+    pub message: Option<String>,
+    pub should_quit: bool,
+}
+
+impl Editor {
+    pub fn new(buffer: Buffer) -> Self {
+        Self {
+            buffer,
+            cursor_row: 0,
+            cursor_col: 0,
+            scroll_row: 0,
+            scroll_col: 0,
+            prefix: PrefixKey::None,
+            message: Some("Welcome to Relic! (C-x C-s: Save, C-x C-c: Quit, C-g: Cancel)".into()),
+            should_quit: false,
+        }
+    }
+
+    pub fn handle_key_event(&mut self, key: KeyEvent) {
+        let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        match self.prefix {
+            PrefixKey::None => {
+                if is_ctrl {
+                    match key.code {
+                        // Emacs basic navigation
+                        KeyCode::Char('n') => self.move_down(),
+                        KeyCode::Char('p') => self.move_up(),
+                        KeyCode::Char('f') => self.move_right(),
+                        KeyCode::Char('b') => self.move_left(),
+                        KeyCode::Char('a') => self.move_to_bol(),
+                        KeyCode::Char('e') => self.move_to_eol(),
+                        KeyCode::Char('d') => self.delete_char(),
+                        KeyCode::Char('h') => self.delete_backspace(),
+                        KeyCode::Char('k') => self.kill_line(),
+                        KeyCode::Char('x') => {
+                            self.prefix = PrefixKey::CtrlX;
+                            self.message = Some("C-x".into());
+                        }
+                        KeyCode::Char('g') => {
+                            self.message = Some("Quit".into());
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Up => self.move_up(),
+                        KeyCode::Down => self.move_down(),
+                        KeyCode::Left => self.move_left(),
+                        KeyCode::Right => self.move_right(),
+                        KeyCode::Home => self.move_to_bol(),
+                        KeyCode::End => self.move_to_eol(),
+                        KeyCode::Backspace => self.delete_backspace(),
+                        KeyCode::Delete => self.delete_char(),
+                        KeyCode::Enter => self.insert_newline(),
+                        KeyCode::Tab => {
+                            for _ in 0..4 {
+                                self.insert_char(' ');
+                            }
+                        }
+                        KeyCode::Char(c) => self.insert_char(c),
+                        KeyCode::Esc => {
+                            self.message = None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            PrefixKey::CtrlX => {
+                self.prefix = PrefixKey::None;
+                if is_ctrl {
+                    match key.code {
+                        KeyCode::Char('s') => self.save_file(),
+                        KeyCode::Char('c') => self.should_quit = true,
+                        KeyCode::Char('g') => {
+                            self.message = Some("Quit".into());
+                        }
+                        _ => {
+                            self.message = Some(format!(
+                                "C-x C-{} is undefined",
+                                match key.code {
+                                    KeyCode::Char(c) => c.to_string(),
+                                    _ => "?".into(),
+                                }
+                            ));
+                        }
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Char('s') => self.save_file(),
+                        KeyCode::Char('c') => self.should_quit = true,
+                        KeyCode::Char('g') | KeyCode::Esc => {
+                            self.message = Some("Quit".into());
+                        }
+                        _ => {
+                            self.message = Some(format!(
+                                "C-x {} is undefined",
+                                match key.code {
+                                    KeyCode::Char(c) => c.to_string(),
+                                    _ => "?".into(),
+                                }
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn save_file(&mut self) {
+        match self.buffer.save() {
+            Ok(()) => {
+                let name = self
+                    .buffer
+                    .path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "[No Name]".into());
+                self.message = Some(format!("Wrote {}", name));
+            }
+            Err(e) => {
+                self.message = Some(format!("Error saving file: {}", e));
+            }
+        }
+    }
+
+    pub fn insert_char(&mut self, c: char) {
+        self.buffer.insert_char(self.cursor_row, self.cursor_col, c);
+        self.cursor_col += 1;
+        self.message = None;
+    }
+
+    pub fn insert_newline(&mut self) {
+        let (new_row, new_col) = self.buffer.insert_newline(self.cursor_row, self.cursor_col);
+        self.cursor_row = new_row;
+        self.cursor_col = new_col;
+        self.message = None;
+    }
+
+    pub fn delete_backspace(&mut self) {
+        if let Some((new_row, new_col)) = self
+            .buffer
+            .delete_backspace(self.cursor_row, self.cursor_col)
+        {
+            self.cursor_row = new_row;
+            self.cursor_col = new_col;
+            self.message = None;
+        }
+    }
+
+    pub fn delete_char(&mut self) {
+        self.buffer.delete_char(self.cursor_row, self.cursor_col);
+        self.message = None;
+    }
+
+    pub fn kill_line(&mut self) {
+        let current_line_len = self.buffer.line_len(self.cursor_row);
+        if self.cursor_col >= current_line_len {
+            self.delete_char();
+        } else {
+            let line_start = self.buffer.rope.line_to_char(self.cursor_row);
+            let from = line_start + self.cursor_col;
+            let to = line_start + current_line_len;
+            if from < to {
+                self.buffer.rope.remove(from..to);
+                self.buffer.is_modified = true;
+            }
+        }
+        self.message = None;
+    }
+
+    pub fn move_up(&mut self) {
+        if self.cursor_row > 0 {
+            self.cursor_row -= 1;
+            self.clamp_cursor_col();
+        }
+        self.message = None;
+    }
+
+    pub fn move_down(&mut self) {
+        let total_lines = self.buffer.len_lines();
+        if self.cursor_row + 1 < total_lines {
+            self.cursor_row += 1;
+            self.clamp_cursor_col();
+        }
+        self.message = None;
+    }
+
+    pub fn move_left(&mut self) {
+        if self.cursor_col > 0 {
+            self.cursor_col -= 1;
+        } else if self.cursor_row > 0 {
+            self.cursor_row -= 1;
+            self.cursor_col = self.buffer.line_len(self.cursor_row);
+        }
+        self.message = None;
+    }
+
+    pub fn move_right(&mut self) {
+        let line_len = self.buffer.line_len(self.cursor_row);
+        if self.cursor_col < line_len {
+            self.cursor_col += 1;
+        } else if self.cursor_row + 1 < self.buffer.len_lines() {
+            self.cursor_row += 1;
+            self.cursor_col = 0;
+        }
+        self.message = None;
+    }
+
+    pub fn move_to_bol(&mut self) {
+        self.cursor_col = 0;
+        self.message = None;
+    }
+
+    pub fn move_to_eol(&mut self) {
+        self.cursor_col = self.buffer.line_len(self.cursor_row);
+        self.message = None;
+    }
+
+    fn clamp_cursor_col(&mut self) {
+        let max_col = self.buffer.line_len(self.cursor_row);
+        if self.cursor_col > max_col {
+            self.cursor_col = max_col;
+        }
+    }
+
+    fn update_scroll(&mut self, text_height: usize, text_width: usize) {
+        if self.cursor_row < self.scroll_row {
+            self.scroll_row = self.cursor_row;
+        } else if self.cursor_row >= self.scroll_row + text_height {
+            self.scroll_row = self.cursor_row - text_height + 1;
+        }
+
+        if self.cursor_col < self.scroll_col {
+            self.scroll_col = self.cursor_col;
+        } else if self.cursor_col >= self.scroll_col + text_width {
+            self.scroll_col = self.cursor_col - text_width + 1;
+        }
+    }
+
+    pub fn render(&mut self, frame: &mut Frame) {
+        let chunks = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+        let text_area = chunks[0];
+        let status_area = chunks[1];
+        let message_area = chunks[2];
+
+        let total_lines = self.buffer.len_lines();
+        let gutter_width = format!("{}", total_lines).len() + 2;
+
+        let content_width = (text_area.width as usize).saturating_sub(gutter_width);
+        let content_height = text_area.height as usize;
+
+        self.update_scroll(content_height, content_width);
+
+        // 1. Text Area Rendering
+        let mut lines = Vec::new();
+        for i in 0..content_height {
+            let line_idx = self.scroll_row + i;
+            if line_idx < total_lines {
+                let gutter_str = format!("{:>width$} ", line_idx + 1, width = gutter_width - 1);
+                let gutter_span = Span::styled(gutter_str, Style::default().fg(Color::DarkGray));
+
+                let line_rope = self.buffer.rope.line(line_idx);
+                let line_len = self.buffer.line_len(line_idx);
+                let content_str = if self.scroll_col < line_len {
+                    let end = (self.scroll_col + content_width).min(line_len);
+                    line_rope.slice(self.scroll_col..end).to_string()
+                } else {
+                    String::new()
+                };
+
+                lines.push(Line::from(vec![gutter_span, Span::raw(content_str)]));
+            } else {
+                let gutter_span = Span::styled(
+                    format!("~{:>width$}", "", width = gutter_width - 1),
+                    Style::default().fg(Color::DarkGray),
+                );
+                lines.push(Line::from(vec![gutter_span]));
+            }
+        }
+
+        let text_widget = Paragraph::new(lines).block(Block::default());
+        frame.render_widget(text_widget, text_area);
+
+        // 2. Status Bar Rendering
+        let file_name = self
+            .buffer
+            .path
+            .as_ref()
+            .map(|p| {
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .unwrap_or_else(|| "[No Name]".into());
+        let mod_flag = if self.buffer.is_modified { " *" } else { "" };
+        let status_left = format!(" - {}{}", file_name, mod_flag);
+        let status_right = format!("Ln {}, Col {} ", self.cursor_row + 1, self.cursor_col + 1);
+
+        let pad_len =
+            (status_area.width as usize).saturating_sub(status_left.len() + status_right.len());
+        let status_text = format!("{}{:pad$}{}", status_left, "", status_right, pad = pad_len);
+
+        let status_widget = Paragraph::new(status_text).style(
+            Style::default()
+                .bg(Color::Rgb(40, 44, 52))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        );
+        frame.render_widget(status_widget, status_area);
+
+        // 3. Message Area (Echo area / Minibuffer)
+        let msg_text = self.message.as_deref().unwrap_or("");
+        let msg_widget = Paragraph::new(msg_text).style(Style::default().fg(Color::Yellow));
+        frame.render_widget(msg_widget, message_area);
+
+        // 4. Cursor Position
+        let screen_cursor_x = text_area.x
+            + gutter_width as u16
+            + (self.cursor_col.saturating_sub(self.scroll_col) as u16);
+        let screen_cursor_y =
+            text_area.y + (self.cursor_row.saturating_sub(self.scroll_row) as u16);
+
+        if screen_cursor_x < text_area.x + text_area.width
+            && screen_cursor_y < text_area.y + text_area.height
+        {
+            frame.set_cursor_position(Position::new(screen_cursor_x, screen_cursor_y));
+        }
+    }
+}
