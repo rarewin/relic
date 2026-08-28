@@ -6,9 +6,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Paragraph},
 };
+use std::path::Path;
 
 use crate::buffer::Buffer;
-use crate::completion::complete_path;
+use crate::completion::{complete_path, expand_tilde};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PrefixKey {
@@ -19,6 +20,7 @@ pub enum PrefixKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptType {
     SaveAs,
+    ConfirmOverwrite(String),
 }
 
 #[derive(Debug, Clone)]
@@ -160,73 +162,100 @@ impl Editor {
     }
 
     fn handle_prompt_key(&mut self, key: KeyEvent, is_ctrl: bool) {
-        if is_ctrl {
-            match key.code {
-                KeyCode::Char('g') => {
-                    self.prompt = None;
-                    self.message = Some("Quit".into());
-                }
-                KeyCode::Char('h') => {
-                    self.prompt_backspace();
-                }
-                KeyCode::Char('a') => {
-                    if let Some(ref mut p) = self.prompt {
-                        p.cursor = 0;
-                        p.completions_hint = None;
+        let prompt_type = self.prompt.as_ref().map(|p| p.prompt_type.clone());
+
+        match prompt_type {
+            Some(PromptType::ConfirmOverwrite(target_path)) => {
+                // Confirm Overwrite dialog: Y / N
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        self.prompt = None;
+                        self.do_save_to(&target_path);
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        self.prompt = None;
+                        self.message = Some("Cancelled".into());
+                    }
+                    KeyCode::Char('g') if is_ctrl => {
+                        self.prompt = None;
+                        self.message = Some("Cancelled".into());
+                    }
+                    _ => {
+                        self.message = Some("Please answer y or n.".into());
                     }
                 }
-                KeyCode::Char('e') => {
-                    if let Some(ref mut p) = self.prompt {
-                        p.cursor = p.input.chars().count();
-                        p.completions_hint = None;
-                    }
-                }
-                KeyCode::Char('b') => {
-                    self.prompt_move_left();
-                }
-                KeyCode::Char('f') => {
-                    self.prompt_move_right();
-                }
-                _ => {}
             }
-        } else {
-            match key.code {
-                KeyCode::Tab => {
-                    self.prompt_complete();
-                }
-                KeyCode::Enter => {
-                    self.confirm_prompt();
-                }
-                KeyCode::Esc => {
-                    self.prompt = None;
-                    self.message = Some("Quit".into());
-                }
-                KeyCode::Backspace => {
-                    self.prompt_backspace();
-                }
-                KeyCode::Left => {
-                    self.prompt_move_left();
-                }
-                KeyCode::Right => {
-                    self.prompt_move_right();
-                }
-                KeyCode::Home => {
-                    if let Some(ref mut p) = self.prompt {
-                        p.cursor = 0;
-                        p.completions_hint = None;
+            Some(PromptType::SaveAs) => {
+                if is_ctrl {
+                    match key.code {
+                        KeyCode::Char('g') => {
+                            self.prompt = None;
+                            self.message = Some("Quit".into());
+                        }
+                        KeyCode::Char('h') => {
+                            self.prompt_backspace();
+                        }
+                        KeyCode::Char('a') => {
+                            if let Some(ref mut p) = self.prompt {
+                                p.cursor = 0;
+                                p.completions_hint = None;
+                            }
+                        }
+                        KeyCode::Char('e') => {
+                            if let Some(ref mut p) = self.prompt {
+                                p.cursor = p.input.chars().count();
+                                p.completions_hint = None;
+                            }
+                        }
+                        KeyCode::Char('b') => {
+                            self.prompt_move_left();
+                        }
+                        KeyCode::Char('f') => {
+                            self.prompt_move_right();
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Tab => {
+                            self.prompt_complete();
+                        }
+                        KeyCode::Enter => {
+                            self.confirm_prompt();
+                        }
+                        KeyCode::Esc => {
+                            self.prompt = None;
+                            self.message = Some("Quit".into());
+                        }
+                        KeyCode::Backspace => {
+                            self.prompt_backspace();
+                        }
+                        KeyCode::Left => {
+                            self.prompt_move_left();
+                        }
+                        KeyCode::Right => {
+                            self.prompt_move_right();
+                        }
+                        KeyCode::Home => {
+                            if let Some(ref mut p) = self.prompt {
+                                p.cursor = 0;
+                                p.completions_hint = None;
+                            }
+                        }
+                        KeyCode::End => {
+                            if let Some(ref mut p) = self.prompt {
+                                p.cursor = p.input.chars().count();
+                                p.completions_hint = None;
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            self.prompt_insert_char(c);
+                        }
+                        _ => {}
                     }
                 }
-                KeyCode::End => {
-                    if let Some(ref mut p) = self.prompt {
-                        p.cursor = p.input.chars().count();
-                        p.completions_hint = None;
-                    }
-                }
-                KeyCode::Char(c) => {
-                    self.prompt_insert_char(c);
-                }
-                _ => {}
             }
+            None => {}
         }
     }
 
@@ -295,17 +324,37 @@ impl Editor {
                     let trimmed = prompt.input.trim();
                     if trimmed.is_empty() {
                         self.message = Some("No file name specified".into());
+                        return;
+                    }
+
+                    let expanded = expand_tilde(trimmed);
+                    let target_path = Path::new(&expanded);
+
+                    // 既に同名ファイルが存在する場合、上書き確認へ移行
+                    if target_path.exists() {
+                        self.prompt = Some(PromptState {
+                            prompt_type: PromptType::ConfirmOverwrite(trimmed.to_string()),
+                            label: format!("File '{}' exists; overwrite? (y or n) ", trimmed),
+                            input: String::new(),
+                            cursor: 0,
+                            completions_hint: None,
+                        });
                     } else {
-                        match self.buffer.save_to(trimmed) {
-                            Ok(()) => {
-                                self.message = Some(format!("Wrote {}", trimmed));
-                            }
-                            Err(e) => {
-                                self.message = Some(format!("Error saving file: {}", e));
-                            }
-                        }
+                        self.do_save_to(trimmed);
                     }
                 }
+                PromptType::ConfirmOverwrite(_) => {}
+            }
+        }
+    }
+
+    fn do_save_to(&mut self, path: &str) {
+        match self.buffer.save_to(path) {
+            Ok(()) => {
+                self.message = Some(format!("Wrote {}", path));
+            }
+            Err(e) => {
+                self.message = Some(format!("Error saving file: {}", e));
             }
         }
     }

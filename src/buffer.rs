@@ -3,6 +3,8 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 
+use crate::completion::expand_tilde;
+
 pub struct Buffer {
     pub rope: Rope,
     pub path: Option<PathBuf>,
@@ -19,7 +21,10 @@ impl Buffer {
     }
 
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let path_buf = path.as_ref().to_path_buf();
+        let path_str = path.as_ref().to_string_lossy();
+        let expanded = expand_tilde(&path_str);
+        let path_buf = PathBuf::from(expanded);
+
         if path_buf.exists() {
             let file = File::open(&path_buf)?;
             let rope = Rope::from_reader(BufReader::new(file))?;
@@ -52,7 +57,10 @@ impl Buffer {
     }
 
     pub fn save_to<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
-        let path_buf = path.as_ref().to_path_buf();
+        let path_str = path.as_ref().to_string_lossy();
+        let expanded = expand_tilde(&path_str);
+        let path_buf = PathBuf::from(expanded);
+
         let file = File::create(&path_buf)?;
         self.rope.write_to(BufWriter::new(file))?;
         self.path = Some(path_buf);

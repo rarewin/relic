@@ -7,7 +7,7 @@ pub struct CompletionResult {
     pub candidates: Vec<String>,
 }
 
-fn expand_tilde(path_str: &str) -> String {
+pub fn expand_tilde(path_str: &str) -> String {
     if path_str == "~" {
         if let Ok(home) = env::var("HOME") {
             return home;
