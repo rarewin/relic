@@ -6,7 +6,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Paragraph},
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::buffer::Buffer;
 use crate::completion::{complete_path, expand_tilde};
@@ -22,6 +22,7 @@ pub enum PrefixKey {
 pub enum PromptType {
     SaveAs,
     ConfirmOverwrite(String),
+    FindFile,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +32,9 @@ pub struct PromptState {
     pub input: String,
     pub cursor: usize,
     pub completions_hint: Option<String>,
+    pub completion_base_dir: Option<String>,
+    pub completion_candidates: Vec<String>,
+    pub completion_index: Option<usize>,
 }
 
 pub struct Editor {
@@ -57,7 +61,7 @@ impl Editor {
             prefix: PrefixKey::None,
             prompt: None,
             message: Some(
-                "Welcome to Relic! (C-x C-s: Save, C-x C-w: Write file, C-x C-c: Quit)".into(),
+                "Welcome to Relic! (C-x C-f: Find file, C-x C-s: Save, C-x C-w: Write file, C-x C-c: Quit)".into(),
             ),
             should_quit: false,
             syntax_registry: SyntaxRegistry::new(),
@@ -125,6 +129,7 @@ impl Editor {
                 self.prefix = PrefixKey::None;
                 if is_ctrl {
                     match key.code {
+                        KeyCode::Char('f') => self.request_find_file(),
                         KeyCode::Char('s') => self.request_save(),
                         KeyCode::Char('w') => self.request_write_file(),
                         KeyCode::Char('c') => self.should_quit = true,
@@ -143,6 +148,7 @@ impl Editor {
                     }
                 } else {
                     match key.code {
+                        KeyCode::Char('f') => self.request_find_file(),
                         KeyCode::Char('s') => self.request_save(),
                         KeyCode::Char('w') => self.request_write_file(),
                         KeyCode::Char('c') => self.should_quit = true,
@@ -188,7 +194,7 @@ impl Editor {
                     }
                 }
             }
-            Some(PromptType::SaveAs) => {
+            Some(PromptType::SaveAs) | Some(PromptType::FindFile) => {
                 if is_ctrl {
                     match key.code {
                         KeyCode::Char('g') => {
@@ -198,16 +204,40 @@ impl Editor {
                         KeyCode::Char('h') => {
                             self.prompt_backspace();
                         }
+                        KeyCode::Char('i') => {
+                            // Ctrl+I is Tab
+                            self.prompt_complete(false);
+                        }
+                        KeyCode::Char('n')
+                            if self
+                                .prompt
+                                .as_ref()
+                                .and_then(|p| p.completion_index)
+                                .is_some() =>
+                        {
+                            self.prompt_complete(false);
+                        }
+                        KeyCode::Char('p')
+                            if self
+                                .prompt
+                                .as_ref()
+                                .and_then(|p| p.completion_index)
+                                .is_some() =>
+                        {
+                            self.prompt_complete(true);
+                        }
                         KeyCode::Char('a') => {
                             if let Some(ref mut p) = self.prompt {
                                 p.cursor = 0;
                                 p.completions_hint = None;
+                                p.completion_index = None;
                             }
                         }
                         KeyCode::Char('e') => {
                             if let Some(ref mut p) = self.prompt {
                                 p.cursor = p.input.chars().count();
                                 p.completions_hint = None;
+                                p.completion_index = None;
                             }
                         }
                         KeyCode::Char('b') => {
@@ -221,7 +251,28 @@ impl Editor {
                 } else {
                     match key.code {
                         KeyCode::Tab => {
-                            self.prompt_complete();
+                            self.prompt_complete(false);
+                        }
+                        KeyCode::BackTab => {
+                            self.prompt_complete(true);
+                        }
+                        KeyCode::Down
+                            if self
+                                .prompt
+                                .as_ref()
+                                .and_then(|p| p.completion_index)
+                                .is_some() =>
+                        {
+                            self.prompt_complete(false);
+                        }
+                        KeyCode::Up
+                            if self
+                                .prompt
+                                .as_ref()
+                                .and_then(|p| p.completion_index)
+                                .is_some() =>
+                        {
+                            self.prompt_complete(true);
                         }
                         KeyCode::Enter => {
                             self.confirm_prompt();
@@ -243,12 +294,14 @@ impl Editor {
                             if let Some(ref mut p) = self.prompt {
                                 p.cursor = 0;
                                 p.completions_hint = None;
+                                p.completion_index = None;
                             }
                         }
                         KeyCode::End => {
                             if let Some(ref mut p) = self.prompt {
                                 p.cursor = p.input.chars().count();
                                 p.completions_hint = None;
+                                p.completion_index = None;
                             }
                         }
                         KeyCode::Char(c) => {
@@ -262,22 +315,73 @@ impl Editor {
         }
     }
 
-    fn prompt_complete(&mut self) {
-        if let Some(ref mut p) = self.prompt {
-            let res = complete_path(&p.input);
+    fn prompt_complete(&mut self, reverse: bool) {
+        let Some(ref mut p) = self.prompt else {
+            return;
+        };
+
+        if !p.completion_candidates.is_empty()
+            && let Some(idx) = p.completion_index
+        {
+            // 既に補完サイクル中の場合：次/前の候補へ進む
+            let total = p.completion_candidates.len();
+            let next_idx = if reverse {
+                if idx == 0 { total - 1 } else { idx - 1 }
+            } else {
+                (idx + 1) % total
+            };
+
+            let base_dir = p.completion_base_dir.as_deref().unwrap_or("");
+            p.input = format!("{}{}", base_dir, p.completion_candidates[next_idx]);
+            p.cursor = p.input.chars().count();
+            p.completion_index = Some(next_idx);
+
+            let preview = format_candidates_hint(&p.completion_candidates, next_idx);
+            p.completions_hint = Some(preview);
+            return;
+        }
+
+        // 初回補完
+        let res = complete_path(&p.input);
+        if res.candidates.is_empty() {
+            p.completions_hint = Some("[No match]".into());
+            p.completion_candidates.clear();
+            p.completion_index = None;
+            return;
+        }
+
+        if res.candidates.len() == 1 {
             if let Some(completed) = res.completed {
                 p.input = completed;
                 p.cursor = p.input.chars().count();
             }
+            p.completions_hint = Some("[Sole completion]".into());
+            p.completion_candidates.clear();
+            p.completion_index = None;
+            return;
+        }
 
-            if res.candidates.is_empty() {
-                p.completions_hint = Some("[No match]".into());
-            } else if res.candidates.len() == 1 {
-                p.completions_hint = Some("[Sole completion]".into());
-            } else {
-                let preview = res.candidates.join("  ");
-                p.completions_hint = Some(format!("[{}]", preview));
-            }
+        // 複数候補がある場合
+        if let Some(completed) = res.completed {
+            // LCP で文字列が進む場合
+            p.input = completed;
+            p.cursor = p.input.chars().count();
+            let preview = res.candidates.join("  ");
+            p.completions_hint = Some(format!("[{}]", preview));
+            p.completion_base_dir = Some(res.raw_dir_part);
+            p.completion_candidates = res.candidates;
+            p.completion_index = None;
+        } else {
+            // LCP では進まない（または既に最長）場合 -> 最初の候補を選択してサイクル開始
+            let first_idx = 0;
+            let base_dir = &res.raw_dir_part;
+            p.input = format!("{}{}", base_dir, res.candidates[first_idx]);
+            p.cursor = p.input.chars().count();
+            p.completion_base_dir = Some(res.raw_dir_part);
+            p.completion_index = Some(first_idx);
+            let preview = format_candidates_hint(&res.candidates, first_idx);
+            p.completions_hint = Some(preview);
+            p.completion_candidates = res.candidates;
         }
     }
 
@@ -285,6 +389,7 @@ impl Editor {
         if let Some(ref mut p) = self.prompt {
             p.cursor = p.cursor.saturating_sub(1);
             p.completions_hint = None;
+            p.completion_index = None;
         }
     }
 
@@ -295,6 +400,7 @@ impl Editor {
                 p.cursor += 1;
             }
             p.completions_hint = None;
+            p.completion_index = None;
         }
     }
 
@@ -305,6 +411,8 @@ impl Editor {
             p.input = chars.into_iter().collect();
             p.cursor += 1;
             p.completions_hint = None;
+            p.completion_index = None;
+            p.completion_candidates.clear();
         }
     }
 
@@ -317,6 +425,8 @@ impl Editor {
             p.input = chars.into_iter().collect();
             p.cursor -= 1;
             p.completions_hint = None;
+            p.completion_index = None;
+            p.completion_candidates.clear();
         }
     }
 
@@ -340,9 +450,41 @@ impl Editor {
                             input: String::new(),
                             cursor: 0,
                             completions_hint: None,
+                            completion_base_dir: None,
+                            completion_candidates: Vec::new(),
+                            completion_index: None,
                         });
                     } else {
                         self.do_save_to(trimmed);
+                    }
+                }
+                PromptType::FindFile => {
+                    let trimmed = prompt.input.trim();
+                    if trimmed.is_empty() {
+                        self.message = Some("No file name specified".into());
+                        return;
+                    }
+
+                    let expanded = expand_tilde(trimmed);
+                    let target_path = PathBuf::from(&expanded);
+
+                    match Buffer::open(&target_path) {
+                        Ok(new_buf) => {
+                            let is_new = !target_path.exists();
+                            self.buffer = new_buf;
+                            self.cursor_row = 0;
+                            self.cursor_col = 0;
+                            self.scroll_row = 0;
+                            self.scroll_col = 0;
+                            if is_new {
+                                self.message = Some(format!("(New file) {}", trimmed));
+                            } else {
+                                self.message = Some(format!("Read {}", trimmed));
+                            }
+                        }
+                        Err(e) => {
+                            self.message = Some(format!("Error opening file: {}", e));
+                        }
                     }
                 }
                 PromptType::ConfirmOverwrite(_) => {}
@@ -361,6 +503,36 @@ impl Editor {
         }
     }
 
+    pub fn request_find_file(&mut self) {
+        let default_input = if let Some(ref p) = self.buffer.path {
+            if let Some(parent) = p.parent() {
+                let s = parent.to_string_lossy();
+                if s.is_empty() || s == "." {
+                    String::new()
+                } else {
+                    format!("{}/", s)
+                }
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        let len = default_input.chars().count();
+        self.prompt = Some(PromptState {
+            prompt_type: PromptType::FindFile,
+            label: "Find file: ".into(),
+            input: default_input,
+            cursor: len,
+            completions_hint: None,
+            completion_base_dir: None,
+            completion_candidates: Vec::new(),
+            completion_index: None,
+        });
+        self.message = None;
+    }
+
     pub fn request_save(&mut self) {
         if self.buffer.path.is_some() {
             self.save_file();
@@ -371,6 +543,9 @@ impl Editor {
                 input: String::new(),
                 cursor: 0,
                 completions_hint: None,
+                completion_base_dir: None,
+                completion_candidates: Vec::new(),
+                completion_index: None,
             });
             self.message = None;
         }
@@ -390,6 +565,9 @@ impl Editor {
             input: default_input,
             cursor: len,
             completions_hint: None,
+            completion_base_dir: None,
+            completion_candidates: Vec::new(),
+            completion_index: None,
         });
         self.message = None;
     }
@@ -697,4 +875,21 @@ fn slice_spans(spans: Vec<Span<'_>>, start_col: usize, max_len: usize) -> Vec<Sp
     }
 
     result
+}
+
+fn format_candidates_hint(candidates: &[String], current_idx: usize) -> String {
+    let mut parts = Vec::new();
+    for (i, c) in candidates.iter().enumerate() {
+        if i == current_idx {
+            parts.push(format!("*{}*", c));
+        } else {
+            parts.push(c.clone());
+        }
+    }
+    format!(
+        "[{}/{}] {}",
+        current_idx + 1,
+        candidates.len(),
+        parts.join("  ")
+    )
 }

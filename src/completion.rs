@@ -5,6 +5,7 @@ use std::path::PathBuf;
 pub struct CompletionResult {
     pub completed: Option<String>,
     pub candidates: Vec<String>,
+    pub raw_dir_part: String,
 }
 
 pub fn expand_tilde(path_str: &str) -> String {
@@ -34,17 +35,24 @@ pub fn complete_path(input: &str) -> CompletionResult {
         PathBuf::from(dir_part)
     };
 
+    let raw_dir_part = match input.rfind('/') {
+        Some(idx) => &input[..=idx],
+        None => "",
+    };
+
     let entries = match fs::read_dir(&search_dir) {
         Ok(read_dir) => read_dir,
         Err(_) => {
             return CompletionResult {
                 completed: None,
                 candidates: Vec::new(),
+                raw_dir_part: raw_dir_part.to_string(),
             };
         }
     };
 
     let mut matches = Vec::new();
+    let file_part_lower = file_part.to_lowercase();
     let include_hidden = file_part.starts_with('.');
 
     for entry in entries.flatten() {
@@ -53,7 +61,8 @@ pub fn complete_path(input: &str) -> CompletionResult {
             continue;
         }
 
-        if name.starts_with(file_part) {
+        let name_lower = name.to_lowercase();
+        if name_lower.starts_with(&file_part_lower) {
             let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
             if is_dir {
                 matches.push(format!("{}/", name));
@@ -67,16 +76,11 @@ pub fn complete_path(input: &str) -> CompletionResult {
         return CompletionResult {
             completed: None,
             candidates: Vec::new(),
+            raw_dir_part: raw_dir_part.to_string(),
         };
     }
 
     matches.sort();
-
-    // ユーザーが元の入力で使っていた dir_part_for_display を求める
-    let raw_dir_part = match input.rfind('/') {
-        Some(idx) => &input[..=idx],
-        None => "",
-    };
 
     if matches.len() == 1 {
         let single = &matches[0];
@@ -84,6 +88,7 @@ pub fn complete_path(input: &str) -> CompletionResult {
         return CompletionResult {
             completed: Some(completed),
             candidates: matches,
+            raw_dir_part: raw_dir_part.to_string(),
         };
     }
 
@@ -92,7 +97,7 @@ pub fn complete_path(input: &str) -> CompletionResult {
     for item in &matches[1..] {
         let mut common_len = 0;
         for (c1, c2) in lcp.chars().zip(item.chars()) {
-            if c1 == c2 {
+            if c1.to_lowercase().to_string() == c2.to_lowercase().to_string() {
                 common_len += c1.len_utf8();
             } else {
                 break;
@@ -102,7 +107,7 @@ pub fn complete_path(input: &str) -> CompletionResult {
     }
 
     let completed_str = format!("{}{}", raw_dir_part, lcp);
-    let completed = if completed_str != input {
+    let completed = if !lcp.is_empty() && completed_str != input {
         Some(completed_str)
     } else {
         None
@@ -111,6 +116,7 @@ pub fn complete_path(input: &str) -> CompletionResult {
     CompletionResult {
         completed,
         candidates: matches,
+        raw_dir_part: raw_dir_part.to_string(),
     }
 }
 
@@ -120,7 +126,13 @@ mod tests {
 
     #[test]
     fn test_completion_cargo() {
-        let res = complete_path("Car");
+        let res = complete_path("car");
         assert!(res.candidates.iter().any(|c| c.starts_with("Cargo.toml")));
+    }
+
+    #[test]
+    fn test_completion_src() {
+        let res = complete_path("src/");
+        assert!(res.candidates.iter().any(|c| c.starts_with("main.rs")));
     }
 }
