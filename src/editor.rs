@@ -16,6 +16,7 @@ use crate::syntax::{SyntaxRegistry, highlight_line};
 pub enum PrefixKey {
     None,
     CtrlX,
+    Meta,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +45,7 @@ pub struct Editor {
     pub cursor_col: usize,
     pub scroll_row: usize,
     pub scroll_col: usize,
+    pub page_height: usize,
     pub prefix: PrefixKey,
     pub prompt: Option<PromptState>,
     pub message: Option<String>,
@@ -59,6 +61,7 @@ impl Editor {
             cursor_col: 0,
             scroll_row: 0,
             scroll_col: 0,
+            page_height: 24,
             prefix: PrefixKey::None,
             prompt: None,
             message: Some(
@@ -71,6 +74,7 @@ impl Editor {
 
     pub fn handle_key_event(&mut self, key: KeyEvent) {
         let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let is_alt = key.modifiers.contains(KeyModifiers::ALT);
 
         // 1. If currently inside a Minibuffer prompt
         if self.prompt.is_some() {
@@ -81,7 +85,11 @@ impl Editor {
         // 2. Normal Editor key handling
         match self.prefix {
             PrefixKey::None => {
-                if is_ctrl {
+                if is_alt {
+                    if let KeyCode::Char('v') = key.code {
+                        self.page_up();
+                    }
+                } else if is_ctrl {
                     match key.code {
                         // Emacs basic navigation
                         KeyCode::Char('n') => self.move_down(),
@@ -90,6 +98,7 @@ impl Editor {
                         KeyCode::Char('b') => self.move_left(),
                         KeyCode::Char('a') => self.move_to_bol(),
                         KeyCode::Char('e') => self.move_to_eol(),
+                        KeyCode::Char('v') => self.page_down(),
                         KeyCode::Char('d') => self.delete_char(),
                         KeyCode::Char('h') => self.delete_backspace(),
                         KeyCode::Char('k') => self.kill_line(),
@@ -110,6 +119,8 @@ impl Editor {
                         KeyCode::Right => self.move_right(),
                         KeyCode::Home => self.move_to_bol(),
                         KeyCode::End => self.move_to_eol(),
+                        KeyCode::PageDown => self.page_down(),
+                        KeyCode::PageUp => self.page_up(),
                         KeyCode::Backspace => self.delete_backspace(),
                         KeyCode::Delete => self.delete_char(),
                         KeyCode::Enter => self.insert_newline(),
@@ -120,7 +131,8 @@ impl Editor {
                         }
                         KeyCode::Char(c) => self.insert_char(c),
                         KeyCode::Esc => {
-                            self.message = None;
+                            self.prefix = PrefixKey::Meta;
+                            self.message = Some("ESC-".into());
                         }
                         _ => {}
                     }
@@ -165,6 +177,24 @@ impl Editor {
                                 }
                             ));
                         }
+                    }
+                }
+            }
+            PrefixKey::Meta => {
+                self.prefix = PrefixKey::None;
+                match key.code {
+                    KeyCode::Char('v') => self.page_up(),
+                    KeyCode::Char('g') | KeyCode::Esc => {
+                        self.message = Some("Quit".into());
+                    }
+                    _ => {
+                        self.message = Some(format!(
+                            "ESC {} is undefined",
+                            match key.code {
+                                KeyCode::Char(c) => c.to_string(),
+                                _ => "?".into(),
+                            }
+                        ));
                     }
                 }
             }
@@ -718,6 +748,25 @@ impl Editor {
         self.message = None;
     }
 
+    pub fn page_down(&mut self) {
+        let step = self.page_height.saturating_sub(2).max(1);
+        let total = self.buffer.len_lines();
+        if self.cursor_row + step < total {
+            self.cursor_row += step;
+        } else {
+            self.cursor_row = total.saturating_sub(1);
+        }
+        self.clamp_cursor_col();
+        self.message = None;
+    }
+
+    pub fn page_up(&mut self) {
+        let step = self.page_height.saturating_sub(2).max(1);
+        self.cursor_row = self.cursor_row.saturating_sub(step);
+        self.clamp_cursor_col();
+        self.message = None;
+    }
+
     fn clamp_cursor_col(&mut self) {
         let max_col = self.buffer.line_len(self.cursor_row);
         if self.cursor_col > max_col {
@@ -757,6 +806,7 @@ impl Editor {
         let content_width = (text_area.width as usize).saturating_sub(gutter_width);
         let content_height = text_area.height as usize;
 
+        self.page_height = content_height;
         self.update_scroll(content_height, content_width);
 
         let syntax_opt = self
