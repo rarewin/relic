@@ -11,8 +11,11 @@ use ratatui::text::Span;
 use definition::{RuleConfig, SyntaxConfig, SyntaxDefinition};
 use theme::Theme;
 
+/// 利用可能なすべての構文定義とテーマを管理するレジストリ。
 pub struct SyntaxRegistry {
+    /// 登録済みの構文定義一覧
     pub definitions: Vec<SyntaxDefinition>,
+    /// 現在適用されているテーマ
     pub theme: Theme,
 }
 
@@ -23,6 +26,7 @@ impl Default for SyntaxRegistry {
 }
 
 impl SyntaxRegistry {
+    /// 組み込み構文定義および `~/.config/relic/syntax/` からのカスタム定義をロードして初期化します。
     pub fn new() -> Self {
         let mut reg = Self {
             definitions: Vec::new(),
@@ -38,6 +42,7 @@ impl SyntaxRegistry {
         reg
     }
 
+    /// ファイルパスの拡張子に基づいて、一致する [`SyntaxDefinition`] を探索します。
     pub fn find_syntax_for_file(&self, path: &Path) -> Option<&SyntaxDefinition> {
         self.definitions.iter().find(|sd| sd.matches_file(path))
     }
@@ -245,6 +250,9 @@ impl SyntaxRegistry {
     }
 }
 
+/// 1行の文字列に対して構文解析・スタイル割り当てを行い、Ratatui の [`Span`] リストとして返します。
+///
+/// 構文定義が指定されていない場合はプレーンテキストの単一 Span を返します。
 pub fn highlight_line<'a>(
     line: &'a str,
     theme: &Theme,

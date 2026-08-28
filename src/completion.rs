@@ -2,12 +2,17 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+/// ファイルパス補完の結果を表す構造体。
 pub struct CompletionResult {
+    /// 補完によって確定・伸長された新しい入力文字列（変更がない場合は `None`）
     pub completed: Option<String>,
+    /// マッチした候補ファイル・ディレクトリ名の一覧
     pub candidates: Vec<String>,
+    /// 補完対象ディレクトリの元のプレフィックス部分（例: `src/`）
     pub raw_dir_part: String,
 }
 
+/// パス文字列中のチルダ（`~` や `~/...`）をホームディレクトリの実パスに展開します。
 pub fn expand_tilde(path_str: &str) -> String {
     if path_str == "~" {
         if let Ok(home) = env::var("HOME") {
@@ -21,6 +26,10 @@ pub fn expand_tilde(path_str: &str) -> String {
     path_str.to_string()
 }
 
+/// 入力されたパス文字列に基づいてファイルシステムを探索し、補完結果を返します。
+///
+/// 大文字・小文字を区別せず（case-insensitive）前方一致マッチングを行います。
+/// ディレクトリの場合は候補名の末尾に `/` が付加されます。
 pub fn complete_path(input: &str) -> CompletionResult {
     let expanded_input = expand_tilde(input);
 

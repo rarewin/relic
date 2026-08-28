@@ -2,16 +2,23 @@ use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// 個別の構文トークンに対する前景色・背景色・字体装飾の設定。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StyleConfig {
+    /// 前景色（色名または `#RRGGBB`）
     pub fg: Option<String>,
+    /// 背景色（色名または `#RRGGBB`）
     pub bg: Option<String>,
+    /// 太字にするかどうか
     pub bold: Option<bool>,
+    /// 斜体（イタリック）にするかどうか
     pub italic: Option<bool>,
+    /// 下線を引くかどうか
     pub underline: Option<bool>,
 }
 
 impl StyleConfig {
+    /// 設定内容を Ratatui の [`Style`] オブジェクトに変換します。
     pub fn to_ratatui_style(&self) -> Style {
         let mut style = Style::default();
 
@@ -41,6 +48,8 @@ impl StyleConfig {
     }
 }
 
+/// 色名文字列（例: `"Red"`, `"Cyan"`, `"DarkGray"`）または16進数カラーコード（例: `"#ff79c6"`）を
+/// Ratatui の [`Color`] にパースします。
 pub fn parse_color(s: &str) -> Option<Color> {
     let lower = s.trim().to_lowercase();
     match lower.as_str() {
@@ -75,13 +84,17 @@ pub fn parse_color(s: &str) -> Option<Color> {
     }
 }
 
+/// エディタ全体のカラースキームと構文スタイルを保持するテーマ構造体。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Theme {
+    /// テーマの名称
     pub name: String,
+    /// トークン名（`"keyword"`, `"string"`, `"comment"` 等）とスタイルのマップ
     pub styles: HashMap<String, StyleConfig>,
 }
 
 impl Theme {
+    /// デフォルトのダークテーマ（One Dark / VS Codeライクな配色）を生成します。
     pub fn default_dark() -> Self {
         let mut styles = HashMap::new();
 
@@ -138,6 +151,8 @@ impl Theme {
         }
     }
 
+    /// 指定されたトークン名（例: `"keyword"`）に対応する [`Style`] を取得します。
+    /// 未定義の場合はデフォルトの空スタイルを返します。
     pub fn get_style(&self, token: &str) -> Style {
         self.styles
             .get(token)

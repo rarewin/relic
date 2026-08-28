@@ -18,6 +18,7 @@ use ratatui::backend::CrosstermBackend;
 use buffer::Buffer;
 use editor::Editor;
 
+/// ターミナル終了時にRawモードの無効化と代替画面の離脱を保証するRAIIガード。
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
@@ -27,6 +28,7 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// パニック発生時に端末の状態を正常に復元するためのカスタムパニックフックを設定します。
 fn setup_panic_hook() {
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
@@ -36,6 +38,10 @@ fn setup_panic_hook() {
     }));
 }
 
+/// アプリケーションのエントリポイント。
+///
+/// コマンドライン引数からファイルパスを取得してバッファを初期化し、
+/// 端末をRawモードへ切り替えてメインイベントループを実行します。
 fn main() -> io::Result<()> {
     setup_panic_hook();
 

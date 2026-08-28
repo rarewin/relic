@@ -12,48 +12,79 @@ use crate::buffer::Buffer;
 use crate::completion::{complete_path, expand_tilde};
 use crate::syntax::{SyntaxRegistry, highlight_line};
 
+/// エディタのプレフィックスキー入力状態。
 #[derive(Debug, PartialEq, Eq)]
 pub enum PrefixKey {
+    /// プレフィックスなしの通常状態
     None,
+    /// `Ctrl+x` が押された後の状態
     CtrlX,
+    /// `Esc` (Meta) が押された後の状態
     Meta,
 }
 
+/// ミニバッファプロンプトの種類。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptType {
+    /// ファイル名指定での保存プロンプト（`Save file as: ` / `Write file: `）
     SaveAs,
+    /// 既存ファイル上書き確認ダイアログ
     ConfirmOverwrite(String),
+    /// ファイルオープンプロンプト（`Find file: `）
     FindFile,
+    /// 未保存変更がある場合の終了確認プロンプト
     ConfirmQuit,
 }
 
+/// ミニバッファでのプロンプト入力状態と補完ステート。
 #[derive(Debug, Clone)]
 pub struct PromptState {
+    /// プロンプトの種別
     pub prompt_type: PromptType,
+    /// 画面左側に表示されるプロンプトラベル（例: `"Find file: "`）
     pub label: String,
+    /// ユーザーが入力中の文字列
     pub input: String,
+    /// 入力文字列内のカーソル位置（文字単位）
     pub cursor: usize,
+    /// プロンプト右側に表示される補完候補ヒント文字列
     pub completions_hint: Option<String>,
+    /// 補完時の基準ディレクトリプレフィックス（例: `"src/"`）
     pub completion_base_dir: Option<String>,
+    /// マッチした補完候補の一覧
     pub completion_candidates: Vec<String>,
+    /// サイクル補完で現在選択中の候補インデックス
     pub completion_index: Option<usize>,
 }
 
+/// テキストエディタの全体状態を管理するメイン構造体。
 pub struct Editor {
+    /// 編集中のテキストバッファ
     pub buffer: Buffer,
+    /// バッファ内のカーソル行位置（0-indexed）
     pub cursor_row: usize,
+    /// バッファ内のカーソル列位置（0-indexed, 文字単位）
     pub cursor_col: usize,
+    /// 画面上端に表示されているバッファの開始行（スクロールオフセット）
     pub scroll_row: usize,
+    /// 画面左端に表示されているバッファの開始列（横スクロールオフセット）
     pub scroll_col: usize,
+    /// エディタ描画領域の行数（高さ）
     pub page_height: usize,
+    /// 現在のプレフィックスキー入力状態
     pub prefix: PrefixKey,
+    /// アクティブなミニバッファプロンプト（存在する場合）
     pub prompt: Option<PromptState>,
+    /// 最下行エコーエリアに表示する通知メッセージ
     pub message: Option<String>,
+    /// エディタの終了フラグ
     pub should_quit: bool,
+    /// 構文ハイライトとテーマのレジストリ
     pub syntax_registry: SyntaxRegistry,
 }
 
 impl Editor {
+    /// 指定された [`Buffer`] を保持する新しい [`Editor`] インスタンスを初期化します。
     pub fn new(buffer: Buffer) -> Self {
         Self {
             buffer,
@@ -72,6 +103,7 @@ impl Editor {
         }
     }
 
+    /// キー入力イベントを受け取り、プロンプト入力または通常のエディタ操作へディスパッチします。
     pub fn handle_key_event(&mut self, key: KeyEvent) {
         let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let is_alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -201,6 +233,7 @@ impl Editor {
         }
     }
 
+    /// ミニバッファプロンプト表示中のキー入力を処理します。
     fn handle_prompt_key(&mut self, key: KeyEvent, is_ctrl: bool) {
         let prompt_type = self.prompt.as_ref().map(|p| p.prompt_type.clone());
 
@@ -363,6 +396,7 @@ impl Editor {
         }
     }
 
+    /// ミニバッファでのTab補完および候補の順繰りサイクル選択を実行します。
     fn prompt_complete(&mut self, reverse: bool) {
         let Some(ref mut p) = self.prompt else {
             return;
@@ -433,6 +467,7 @@ impl Editor {
         }
     }
 
+    /// ミニバッファプロンプト内のカーソルを1文字左へ移動します。
     fn prompt_move_left(&mut self) {
         if let Some(ref mut p) = self.prompt {
             p.cursor = p.cursor.saturating_sub(1);
@@ -441,6 +476,7 @@ impl Editor {
         }
     }
 
+    /// ミニバッファプロンプト内のカーソルを1文字右へ移動します。
     fn prompt_move_right(&mut self) {
         if let Some(ref mut p) = self.prompt {
             let max = p.input.chars().count();
@@ -452,6 +488,7 @@ impl Editor {
         }
     }
 
+    /// ミニバッファプロンプトに1文字挿入します。
     fn prompt_insert_char(&mut self, c: char) {
         if let Some(ref mut p) = self.prompt {
             let mut chars: Vec<char> = p.input.chars().collect();
@@ -464,6 +501,7 @@ impl Editor {
         }
     }
 
+    /// ミニバッファプロンプトでカーソル直前の1文字を削除します。
     fn prompt_backspace(&mut self) {
         if let Some(ref mut p) = self.prompt
             && p.cursor > 0
@@ -478,6 +516,7 @@ impl Editor {
         }
     }
 
+    /// ミニバッファプロンプトでEnterが押されたときに、入力された内容を確定して対応アクションを実行します。
     fn confirm_prompt(&mut self) {
         if let Some(prompt) = self.prompt.take() {
             match prompt.prompt_type {
@@ -540,6 +579,7 @@ impl Editor {
         }
     }
 
+    /// 指定パスへのバッファ保存を実行し、結果メッセージを設定します。
     fn do_save_to(&mut self, path: &str) {
         match self.buffer.save_to(path) {
             Ok(()) => {
@@ -551,6 +591,7 @@ impl Editor {
         }
     }
 
+    /// エディタの終了を要求します。未保存の変更がある場合は確認プロンプトを表示します。
     pub fn request_quit(&mut self) {
         if self.buffer.is_modified {
             self.prompt = Some(PromptState {
@@ -569,6 +610,7 @@ impl Editor {
         }
     }
 
+    /// ファイルオープンプロンプト（`Find file: `）を開始します。
     pub fn request_find_file(&mut self) {
         let default_input = if let Some(ref p) = self.buffer.path {
             if let Some(parent) = p.parent() {
@@ -599,6 +641,7 @@ impl Editor {
         self.message = None;
     }
 
+    /// ファイル保存を要求します。ファイルパスが未設定の場合は `Save file as: ` プロンプトを開きます。
     pub fn request_save(&mut self) {
         if self.buffer.path.is_some() {
             self.save_file();
@@ -617,6 +660,7 @@ impl Editor {
         }
     }
 
+    /// 名前を付けて保存プロンプト（`Write file: `）を開始します。
     pub fn request_write_file(&mut self) {
         let default_input = self
             .buffer
@@ -638,6 +682,7 @@ impl Editor {
         self.message = None;
     }
 
+    /// 現在のファイルパスにバッファを保存します。
     pub fn save_file(&mut self) {
         match self.buffer.save() {
             Ok(()) => {
@@ -655,12 +700,14 @@ impl Editor {
         }
     }
 
+    /// カーソル位置に1文字挿入します。
     pub fn insert_char(&mut self, c: char) {
         self.buffer.insert_char(self.cursor_row, self.cursor_col, c);
         self.cursor_col += 1;
         self.message = None;
     }
 
+    /// カーソル位置に改行を挿入し、カーソルを次行の先頭へ移動します。
     pub fn insert_newline(&mut self) {
         let (new_row, new_col) = self.buffer.insert_newline(self.cursor_row, self.cursor_col);
         self.cursor_row = new_row;
@@ -668,6 +715,7 @@ impl Editor {
         self.message = None;
     }
 
+    /// カーソル直前の文字を削除（バックスペース）します。
     pub fn delete_backspace(&mut self) {
         if let Some((new_row, new_col)) = self
             .buffer
@@ -679,11 +727,14 @@ impl Editor {
         }
     }
 
+    /// カーソル位置の文字を削除（Delete）します。
     pub fn delete_char(&mut self) {
         self.buffer.delete_char(self.cursor_row, self.cursor_col);
         self.message = None;
     }
 
+    /// カーソル位置から行末までの文字列を削除（Kill line）します。
+    /// 行末にカーソルがある場合は改行を削除して次行を連結します。
     pub fn kill_line(&mut self) {
         let current_line_len = self.buffer.line_len(self.cursor_row);
         if self.cursor_col >= current_line_len {
@@ -700,6 +751,7 @@ impl Editor {
         self.message = None;
     }
 
+    /// カーソルを1行上へ移動します。
     pub fn move_up(&mut self) {
         if self.cursor_row > 0 {
             self.cursor_row -= 1;
@@ -708,6 +760,7 @@ impl Editor {
         self.message = None;
     }
 
+    /// カーソルを1行下へ移動します。
     pub fn move_down(&mut self) {
         let total_lines = self.buffer.len_lines();
         if self.cursor_row + 1 < total_lines {
@@ -717,6 +770,7 @@ impl Editor {
         self.message = None;
     }
 
+    /// カーソルを1文字左へ移動します（行頭の場合は前行の行末へ移動）。
     pub fn move_left(&mut self) {
         if self.cursor_col > 0 {
             self.cursor_col -= 1;
@@ -727,6 +781,7 @@ impl Editor {
         self.message = None;
     }
 
+    /// カーソルを1文字右へ移動します（行末の場合は次行の行頭へ移動）。
     pub fn move_right(&mut self) {
         let line_len = self.buffer.line_len(self.cursor_row);
         if self.cursor_col < line_len {
@@ -738,16 +793,19 @@ impl Editor {
         self.message = None;
     }
 
+    /// カーソルを現在の行頭へ移動します。
     pub fn move_to_bol(&mut self) {
         self.cursor_col = 0;
         self.message = None;
     }
 
+    /// カーソルを現在の行末へ移動します。
     pub fn move_to_eol(&mut self) {
         self.cursor_col = self.buffer.line_len(self.cursor_row);
         self.message = None;
     }
 
+    /// 1画面分下へスクロールし、カーソルを移動します（Page Down / C-v）。
     pub fn page_down(&mut self) {
         let step = self.page_height.saturating_sub(2).max(1);
         let total = self.buffer.len_lines();
@@ -760,6 +818,7 @@ impl Editor {
         self.message = None;
     }
 
+    /// 1画面分上へスクロールし、カーソルを移動します（Page Up / M-v）。
     pub fn page_up(&mut self) {
         let step = self.page_height.saturating_sub(2).max(1);
         self.cursor_row = self.cursor_row.saturating_sub(step);
@@ -767,6 +826,7 @@ impl Editor {
         self.message = None;
     }
 
+    /// 現在の行の長さを超えないようカーソル列座標を制限します。
     fn clamp_cursor_col(&mut self) {
         let max_col = self.buffer.line_len(self.cursor_row);
         if self.cursor_col > max_col {
@@ -774,6 +834,7 @@ impl Editor {
         }
     }
 
+    /// カーソルが画面内に収まるように画面の縦横スクロールオフセットを更新します。
     fn update_scroll(&mut self, text_height: usize, text_width: usize) {
         if self.cursor_row < self.scroll_row {
             self.scroll_row = self.cursor_row;
@@ -788,6 +849,7 @@ impl Editor {
         }
     }
 
+    /// エディタ画面全体（テキスト領域・行番号・ステータスバー・ミニバッファ）をレンダリングします。
     pub fn render(&mut self, frame: &mut Frame) {
         let chunks = Layout::vertical([
             Constraint::Min(1),
@@ -929,6 +991,7 @@ impl Editor {
     }
 }
 
+/// ハイライト済みSpanのリストを、横スクロールの開始列と表示幅に合わせてスライスします。
 fn slice_spans(spans: Vec<Span<'_>>, start_col: usize, max_len: usize) -> Vec<Span<'static>> {
     let mut result = Vec::new();
     let mut current_col = 0;
@@ -963,6 +1026,7 @@ fn slice_spans(spans: Vec<Span<'_>>, start_col: usize, max_len: usize) -> Vec<Sp
     result
 }
 
+/// 補完候補一覧と現在選択中のインデックスから、ヒントプレビュー文字列（例: `[1/3] *main.rs*  buffer.rs`）を生成します。
 fn format_candidates_hint(candidates: &[String], current_idx: usize) -> String {
     let mut parts = Vec::new();
     for (i, c) in candidates.iter().enumerate() {
