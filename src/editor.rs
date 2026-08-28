@@ -23,6 +23,7 @@ pub enum PromptType {
     SaveAs,
     ConfirmOverwrite(String),
     FindFile,
+    ConfirmQuit,
 }
 
 #[derive(Debug, Clone)]
@@ -132,7 +133,7 @@ impl Editor {
                         KeyCode::Char('f') => self.request_find_file(),
                         KeyCode::Char('s') => self.request_save(),
                         KeyCode::Char('w') => self.request_write_file(),
-                        KeyCode::Char('c') => self.should_quit = true,
+                        KeyCode::Char('c') => self.request_quit(),
                         KeyCode::Char('g') => {
                             self.message = Some("Quit".into());
                         }
@@ -151,7 +152,7 @@ impl Editor {
                         KeyCode::Char('f') => self.request_find_file(),
                         KeyCode::Char('s') => self.request_save(),
                         KeyCode::Char('w') => self.request_write_file(),
-                        KeyCode::Char('c') => self.should_quit = true,
+                        KeyCode::Char('c') => self.request_quit(),
                         KeyCode::Char('g') | KeyCode::Esc => {
                             self.message = Some("Quit".into());
                         }
@@ -174,6 +175,23 @@ impl Editor {
         let prompt_type = self.prompt.as_ref().map(|p| p.prompt_type.clone());
 
         match prompt_type {
+            Some(PromptType::ConfirmQuit) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.prompt = None;
+                    self.should_quit = true;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.prompt = None;
+                    self.message = Some("Cancelled".into());
+                }
+                KeyCode::Char('g') if is_ctrl => {
+                    self.prompt = None;
+                    self.message = Some("Cancelled".into());
+                }
+                _ => {
+                    self.message = Some("Please answer y or n.".into());
+                }
+            },
             Some(PromptType::ConfirmOverwrite(target_path)) => {
                 // Confirm Overwrite dialog: Y / N
                 match key.code {
@@ -487,7 +505,7 @@ impl Editor {
                         }
                     }
                 }
-                PromptType::ConfirmOverwrite(_) => {}
+                PromptType::ConfirmOverwrite(_) | PromptType::ConfirmQuit => {}
             }
         }
     }
@@ -500,6 +518,24 @@ impl Editor {
             Err(e) => {
                 self.message = Some(format!("Error saving file: {}", e));
             }
+        }
+    }
+
+    pub fn request_quit(&mut self) {
+        if self.buffer.is_modified {
+            self.prompt = Some(PromptState {
+                prompt_type: PromptType::ConfirmQuit,
+                label: "Modified buffer has unsaved changes. Quit anyway? (y or n) ".into(),
+                input: String::new(),
+                cursor: 0,
+                completions_hint: None,
+                completion_base_dir: None,
+                completion_candidates: Vec::new(),
+                completion_index: None,
+            });
+            self.message = None;
+        } else {
+            self.should_quit = true;
         }
     }
 
