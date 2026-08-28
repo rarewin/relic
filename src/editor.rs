@@ -10,6 +10,7 @@ use std::path::Path;
 
 use crate::buffer::Buffer;
 use crate::completion::{complete_path, expand_tilde};
+use crate::syntax::{SyntaxRegistry, highlight_line};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PrefixKey {
@@ -42,6 +43,7 @@ pub struct Editor {
     pub prompt: Option<PromptState>,
     pub message: Option<String>,
     pub should_quit: bool,
+    pub syntax_registry: SyntaxRegistry,
 }
 
 impl Editor {
@@ -58,6 +60,7 @@ impl Editor {
                 "Welcome to Relic! (C-x C-s: Save, C-x C-w: Write file, C-x C-c: Quit)".into(),
             ),
             should_quit: false,
+            syntax_registry: SyntaxRegistry::new(),
         }
     }
 
@@ -330,7 +333,6 @@ impl Editor {
                     let expanded = expand_tilde(trimmed);
                     let target_path = Path::new(&expanded);
 
-                    // 既に同名ファイルが存在する場合、上書き確認へ移行
                     if target_path.exists() {
                         self.prompt = Some(PromptState {
                             prompt_type: PromptType::ConfirmOverwrite(trimmed.to_string()),
@@ -543,6 +545,12 @@ impl Editor {
 
         self.update_scroll(content_height, content_width);
 
+        let syntax_opt = self
+            .buffer
+            .path
+            .as_ref()
+            .and_then(|p| self.syntax_registry.find_syntax_for_file(p));
+
         // 1. Text Area Rendering
         let mut lines = Vec::new();
         for i in 0..content_height {
@@ -552,15 +560,20 @@ impl Editor {
                 let gutter_span = Span::styled(gutter_str, Style::default().fg(Color::DarkGray));
 
                 let line_rope = self.buffer.rope.line(line_idx);
-                let line_len = self.buffer.line_len(line_idx);
-                let content_str = if self.scroll_col < line_len {
-                    let end = (self.scroll_col + content_width).min(line_len);
-                    line_rope.slice(self.scroll_col..end).to_string()
-                } else {
-                    String::new()
-                };
+                let full_line_str = line_rope.to_string();
+                let full_line_trimmed = full_line_str.trim_end_matches(['\r', '\n']);
 
-                lines.push(Line::from(vec![gutter_span, Span::raw(content_str)]));
+                // シンタックスハイライト適用
+                let highlighted_spans =
+                    highlight_line(full_line_trimmed, &self.syntax_registry.theme, syntax_opt);
+
+                // 横スクロールに応じたスライス
+                let visible_spans = slice_spans(highlighted_spans, self.scroll_col, content_width);
+
+                let mut line_spans = vec![gutter_span];
+                line_spans.extend(visible_spans);
+
+                lines.push(Line::from(line_spans));
             } else {
                 let gutter_span = Span::styled(
                     format!("~{:>width$}", "", width = gutter_width - 1),
@@ -586,7 +599,9 @@ impl Editor {
             })
             .unwrap_or_else(|| "[No Name]".into());
         let mod_flag = if self.buffer.is_modified { " *" } else { "" };
-        let status_left = format!(" - {}{}", file_name, mod_flag);
+        let syntax_name = syntax_opt.map(|s| s.name.as_str()).unwrap_or("Plain Text");
+
+        let status_left = format!(" - {}{} [{}]", file_name, mod_flag, syntax_name);
         let status_right = format!("Ln {}, Col {} ", self.cursor_row + 1, self.cursor_col + 1);
 
         let pad_len =
@@ -648,4 +663,38 @@ impl Editor {
             }
         }
     }
+}
+
+fn slice_spans(spans: Vec<Span<'_>>, start_col: usize, max_len: usize) -> Vec<Span<'static>> {
+    let mut result = Vec::new();
+    let mut current_col = 0;
+    let end_col = start_col + max_len;
+
+    for span in spans {
+        let span_len = span.content.chars().count();
+        let span_start = current_col;
+        let span_end = current_col + span_len;
+
+        if span_end > start_col && span_start < end_col {
+            let slice_start = start_col.saturating_sub(span_start);
+            let slice_end = (end_col - span_start).min(span_len);
+
+            if slice_start < slice_end {
+                let text: String = span
+                    .content
+                    .chars()
+                    .skip(slice_start)
+                    .take(slice_end - slice_start)
+                    .collect();
+                result.push(Span::styled(text, span.style));
+            }
+        }
+
+        current_col = span_end;
+        if current_col >= end_col {
+            break;
+        }
+    }
+
+    result
 }

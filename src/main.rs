@@ -1,6 +1,7 @@
 mod buffer;
 mod completion;
 mod editor;
+mod syntax;
 
 use std::env;
 use std::io::{self, stdout};
