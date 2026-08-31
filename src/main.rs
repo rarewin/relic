@@ -8,9 +8,15 @@ use std::io::{self, stdout};
 use std::panic;
 
 use crossterm::{
-    event::{self, Event, KeyEventKind},
+    event::{
+        self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
+    },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        supports_keyboard_enhancement,
+    },
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -18,11 +24,16 @@ use ratatui::backend::CrosstermBackend;
 use buffer::Buffer;
 use editor::Editor;
 
-/// ターミナル終了時にRawモードの無効化と代替画面の離脱を保証するRAIIガード。
-struct TerminalGuard;
+/// ターミナル終了時にRawモードの無効化、代替画面の離脱、キーボード拡張フラグのリセットを保証するRAIIガード。
+struct TerminalGuard {
+    enhanced_keyboard: bool,
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        if self.enhanced_keyboard {
+            let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+        }
         let _ = disable_raw_mode();
         let _ = execute!(stdout(), LeaveAlternateScreen);
     }
@@ -32,6 +43,7 @@ impl Drop for TerminalGuard {
 fn setup_panic_hook() {
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
+        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
         let _ = disable_raw_mode();
         let _ = execute!(stdout(), LeaveAlternateScreen);
         original_hook(panic_info);
@@ -56,7 +68,18 @@ fn main() -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
-    let _guard = TerminalGuard;
+
+    let enhanced_keyboard = supports_keyboard_enhancement().unwrap_or(false);
+    if enhanced_keyboard {
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            )
+        );
+    }
+    let _guard = TerminalGuard { enhanced_keyboard };
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;

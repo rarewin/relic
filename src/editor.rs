@@ -117,13 +117,28 @@ impl Editor {
         // 2. Normal Editor key handling
         match self.prefix {
             PrefixKey::None => {
+                // ASCII 0x1F (Unit Separator = Ctrl+/ or Ctrl+_)
+                if key.code == KeyCode::Char('\x1f') || key.code == KeyCode::Char('\u{001f}') {
+                    self.undo();
+                    return;
+                }
+
                 if is_alt {
-                    if let KeyCode::Char('v') = key.code {
-                        self.page_up();
+                    match key.code {
+                        KeyCode::Char('v') => self.page_up(),
+                        KeyCode::Char('_') | KeyCode::Char('-') => self.redo(),
+                        _ => {}
                     }
                 } else if is_ctrl {
                     match key.code {
-                        // Emacs basic navigation
+                        // Undo: ターミナルVT100規格では ASCII 0x1F (C-/, C-_, C-7) が Undo に対応
+                        // (Crossterm は 0x1F を Char('7') + CONTROL または Char('_') としてデコードする)
+                        KeyCode::Char('/')
+                        | KeyCode::Char('_')
+                        | KeyCode::Char('7')
+                        | KeyCode::Char('\x1f') => self.undo(),
+
+                        // Emacs basic navigation & editing
                         KeyCode::Char('n') => self.move_down(),
                         KeyCode::Char('p') => self.move_up(),
                         KeyCode::Char('f') => self.move_right(),
@@ -141,7 +156,15 @@ impl Editor {
                         KeyCode::Char('g') => {
                             self.message = Some("Quit".into());
                         }
-                        _ => {}
+                        _ => {
+                            self.message = Some(format!(
+                                "C-{} is undefined",
+                                match key.code {
+                                    KeyCode::Char(c) => c.to_string(),
+                                    _ => "?".into(),
+                                }
+                            ));
+                        }
                     }
                 } else {
                     match key.code {
@@ -177,6 +200,7 @@ impl Editor {
                         KeyCode::Char('f') => self.request_find_file(),
                         KeyCode::Char('s') => self.request_save(),
                         KeyCode::Char('w') => self.request_write_file(),
+                        KeyCode::Char('u') => self.undo(),
                         KeyCode::Char('c') => self.request_quit(),
                         KeyCode::Char('g') => {
                             self.message = Some("Quit".into());
@@ -196,6 +220,7 @@ impl Editor {
                         KeyCode::Char('f') => self.request_find_file(),
                         KeyCode::Char('s') => self.request_save(),
                         KeyCode::Char('w') => self.request_write_file(),
+                        KeyCode::Char('u') => self.undo(),
                         KeyCode::Char('c') => self.request_quit(),
                         KeyCode::Char('g') | KeyCode::Esc => {
                             self.message = Some("Quit".into());
@@ -216,6 +241,7 @@ impl Editor {
                 self.prefix = PrefixKey::None;
                 match key.code {
                     KeyCode::Char('v') => self.page_up(),
+                    KeyCode::Char('_') | KeyCode::Char('-') => self.redo(),
                     KeyCode::Char('g') | KeyCode::Esc => {
                         self.message = Some("Quit".into());
                     }
@@ -702,8 +728,9 @@ impl Editor {
 
     /// カーソル位置に1文字挿入します。
     pub fn insert_char(&mut self, c: char) {
-        self.buffer.insert_char(self.cursor_row, self.cursor_col, c);
-        self.cursor_col += 1;
+        let (new_row, new_col) = self.buffer.insert_char(self.cursor_row, self.cursor_col, c);
+        self.cursor_row = new_row;
+        self.cursor_col = new_col;
         self.message = None;
     }
 
@@ -740,15 +767,35 @@ impl Editor {
         if self.cursor_col >= current_line_len {
             self.delete_char();
         } else {
-            let line_start = self.buffer.rope.line_to_char(self.cursor_row);
-            let from = line_start + self.cursor_col;
-            let to = line_start + current_line_len;
-            if from < to {
-                self.buffer.rope.remove(from..to);
-                self.buffer.is_modified = true;
-            }
+            let delete_len = current_line_len - self.cursor_col;
+            self.buffer
+                .delete_range(self.cursor_row, self.cursor_col, delete_len);
         }
         self.message = None;
+    }
+
+    /// 直前の編集操作を取り消します（Undo）。
+    pub fn undo(&mut self) {
+        if let Some((new_row, new_col)) = self.buffer.undo() {
+            self.cursor_row = new_row;
+            self.cursor_col = new_col;
+            self.clamp_cursor_col();
+            self.message = Some("Undo!".into());
+        } else {
+            self.message = Some("No further undo information".into());
+        }
+    }
+
+    /// 取り消した編集操作を再実行します（Redo）。
+    pub fn redo(&mut self) {
+        if let Some((new_row, new_col)) = self.buffer.redo() {
+            self.cursor_row = new_row;
+            self.cursor_col = new_col;
+            self.clamp_cursor_col();
+            self.message = Some("Redo!".into());
+        } else {
+            self.message = Some("No further redo information".into());
+        }
     }
 
     /// カーソルを1行上へ移動します。
