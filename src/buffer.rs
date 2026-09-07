@@ -264,6 +264,70 @@ impl Buffer {
         }
     }
 
+    /// 指定した2点間の選択範囲（リージョン）のテキストを取得します。
+    pub fn get_region_text(&self, mark: (usize, usize), point: (usize, usize)) -> String {
+        let idx1 = self.point_to_char_idx(mark.0, mark.1);
+        let idx2 = self.point_to_char_idx(point.0, point.1);
+        let from = idx1.min(idx2);
+        let to = idx1.max(idx2);
+        if from == to {
+            String::new()
+        } else {
+            self.rope.slice(from..to).to_string()
+        }
+    }
+
+    /// 指定した2点間の選択範囲（リージョン）を削除し、削除後の新しいカーソル位置 `(row, col)` を返します。
+    pub fn delete_region(&mut self, mark: (usize, usize), point: (usize, usize)) -> (usize, usize) {
+        let idx1 = self.point_to_char_idx(mark.0, mark.1);
+        let idx2 = self.point_to_char_idx(point.0, point.1);
+        let from = idx1.min(idx2);
+        let to = idx1.max(idx2);
+        if from == to {
+            return point;
+        }
+
+        let deleted_slice = self.rope.slice(from..to);
+        let deleted_text = deleted_slice.to_string();
+        self.rope.remove(from..to);
+
+        let new_cursor = self.char_idx_to_point(from);
+        self.push_undo_group(UndoGroup {
+            actions: vec![EditAction::Delete {
+                char_idx: from,
+                text: deleted_text,
+            }],
+            cursor_before: point,
+            cursor_after: new_cursor,
+        });
+
+        new_cursor
+    }
+
+    /// 指定した行・列位置に文字列を挿入し、挿入後の新しいカーソル位置 `(row, col)` を返します。
+    pub fn insert_str(&mut self, row: usize, col: usize, text: &str) -> (usize, usize) {
+        if text.is_empty() {
+            return (row, col);
+        }
+
+        let char_idx = self.point_to_char_idx(row, col);
+        self.rope.insert(char_idx, text);
+
+        let new_char_idx = char_idx + text.chars().count();
+        let cursor_after = self.char_idx_to_point(new_char_idx);
+
+        self.push_undo_group(UndoGroup {
+            actions: vec![EditAction::Insert {
+                char_idx,
+                text: text.to_string(),
+            }],
+            cursor_before: (row, col),
+            cursor_after,
+        });
+
+        cursor_after
+    }
+
     /// 直前の操作を取り消し（Undo）、移動すべきカーソル位置 `(row, col)` を返します。
     pub fn undo(&mut self) -> Option<(usize, usize)> {
         let group = self.undo_stack.pop()?;
@@ -321,6 +385,15 @@ impl Buffer {
         let max_col = self.line_len(clamped_row);
         let clamped_col = col.min(max_col);
         (line_start + clamped_col).min(self.rope.len_chars())
+    }
+
+    /// 絶対文字インデックス `char_idx` を、行・列の座標 `(row, col)` に逆変換します。
+    pub fn char_idx_to_point(&self, char_idx: usize) -> (usize, usize) {
+        let clamped_idx = char_idx.min(self.rope.len_chars());
+        let row = self.rope.char_to_line(clamped_idx);
+        let line_start = self.rope.line_to_char(row);
+        let col = clamped_idx - line_start;
+        (row, col)
     }
 }
 
@@ -397,5 +470,34 @@ mod tests {
 
         buf.undo(); // undo delete_range
         assert_eq!(buf.rope.to_string(), "x");
+    }
+
+    #[test]
+    fn test_region_get_delete_undo() {
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, "Hello, World!");
+        assert_eq!(buf.rope.to_string(), "Hello, World!");
+
+        let text = buf.get_region_text((0, 7), (0, 12));
+        assert_eq!(text, "World");
+
+        let pos = buf.delete_region((0, 7), (0, 12));
+        assert_eq!(pos, (0, 7));
+        assert_eq!(buf.rope.to_string(), "Hello, !");
+
+        let pos = buf.undo();
+        assert_eq!(pos, Some((0, 12)));
+        assert_eq!(buf.rope.to_string(), "Hello, World!");
+    }
+
+    #[test]
+    fn test_insert_str_and_undo() {
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, "Line 1\nLine 2");
+        assert_eq!(buf.rope.to_string(), "Line 1\nLine 2");
+
+        let pos = buf.undo();
+        assert_eq!(pos, Some((0, 0)));
+        assert_eq!(buf.rope.to_string(), "");
     }
 }

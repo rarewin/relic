@@ -57,6 +57,25 @@ pub struct PromptState {
     pub completion_index: Option<usize>,
 }
 
+/// 選択範囲（リージョン）の選択モード。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum SelectionMode {
+    /// 通常の連続テキスト選択モード
+    Normal,
+    /// 矩形選択モード（将来の矩形編集用）
+    Rectangle,
+}
+
+/// 選択範囲（リージョン）の状態を管理する構造体。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selection {
+    /// マークされた開始点座標 (row, col)
+    pub mark: (usize, usize),
+    /// 選択モード
+    pub mode: SelectionMode,
+}
+
 /// テキストエディタの全体状態を管理するメイン構造体。
 pub struct Editor {
     /// 編集中のテキストバッファ
@@ -81,6 +100,12 @@ pub struct Editor {
     pub should_quit: bool,
     /// 構文ハイライトとテーマのレジストリ
     pub syntax_registry: SyntaxRegistry,
+    /// 現在アクティブな選択範囲（マークが設定されていない場合は `None`）
+    pub selection: Option<Selection>,
+    /// コピー・カットされたテキストを保持するキルリング
+    pub kill_ring: Vec<String>,
+    /// 直前のコマンドがキル操作だったかどうかのフラグ（連続キル時の結合に使用）
+    pub last_command_was_kill: bool,
 }
 
 impl Editor {
@@ -100,6 +125,9 @@ impl Editor {
             ),
             should_quit: false,
             syntax_registry: SyntaxRegistry::new(),
+            selection: None,
+            kill_ring: Vec::new(),
+            last_command_was_kill: false,
         }
     }
 
@@ -125,12 +153,22 @@ impl Editor {
 
                 if is_alt {
                     match key.code {
+                        KeyCode::Char('w') => self.kill_ring_save(),
                         KeyCode::Char('v') => self.page_up(),
                         KeyCode::Char('_') | KeyCode::Char('-') => self.redo(),
                         _ => {}
                     }
                 } else if is_ctrl {
                     match key.code {
+                        // Mark / Selection (C-SPC / C-@)
+                        KeyCode::Char(' ') | KeyCode::Char('@') | KeyCode::Char('\0') => {
+                            self.set_mark_command()
+                        }
+
+                        // Copy / Cut / Paste
+                        KeyCode::Char('w') => self.kill_region(),
+                        KeyCode::Char('y') => self.yank(),
+
                         // Undo: ターミナルVT100規格では ASCII 0x1F (C-/, C-_, C-7) が Undo に対応
                         // (Crossterm は 0x1F を Char('7') + CONTROL または Char('_') としてデコードする)
                         KeyCode::Char('/')
@@ -153,9 +191,7 @@ impl Editor {
                             self.prefix = PrefixKey::CtrlX;
                             self.message = Some("C-x".into());
                         }
-                        KeyCode::Char('g') => {
-                            self.message = Some("Quit".into());
-                        }
+                        KeyCode::Char('g') => self.cancel_current_operation(),
                         _ => {
                             self.message = Some(format!(
                                 "C-{} is undefined",
@@ -168,6 +204,7 @@ impl Editor {
                     }
                 } else {
                     match key.code {
+                        KeyCode::Null => self.set_mark_command(),
                         KeyCode::Up => self.move_up(),
                         KeyCode::Down => self.move_down(),
                         KeyCode::Left => self.move_left(),
@@ -202,9 +239,7 @@ impl Editor {
                         KeyCode::Char('w') => self.request_write_file(),
                         KeyCode::Char('u') => self.undo(),
                         KeyCode::Char('c') => self.request_quit(),
-                        KeyCode::Char('g') => {
-                            self.message = Some("Quit".into());
-                        }
+                        KeyCode::Char('g') => self.cancel_current_operation(),
                         _ => {
                             self.message = Some(format!(
                                 "C-x C-{} is undefined",
@@ -222,9 +257,7 @@ impl Editor {
                         KeyCode::Char('w') => self.request_write_file(),
                         KeyCode::Char('u') => self.undo(),
                         KeyCode::Char('c') => self.request_quit(),
-                        KeyCode::Char('g') | KeyCode::Esc => {
-                            self.message = Some("Quit".into());
-                        }
+                        KeyCode::Char('g') | KeyCode::Esc => self.cancel_current_operation(),
                         _ => {
                             self.message = Some(format!(
                                 "C-x {} is undefined",
@@ -240,11 +273,10 @@ impl Editor {
             PrefixKey::Meta => {
                 self.prefix = PrefixKey::None;
                 match key.code {
+                    KeyCode::Char('w') => self.kill_ring_save(),
                     KeyCode::Char('v') => self.page_up(),
                     KeyCode::Char('_') | KeyCode::Char('-') => self.redo(),
-                    KeyCode::Char('g') | KeyCode::Esc => {
-                        self.message = Some("Quit".into());
-                    }
+                    KeyCode::Char('g') | KeyCode::Esc => self.cancel_current_operation(),
                     _ => {
                         self.message = Some(format!(
                             "ESC {} is undefined",
@@ -728,6 +760,7 @@ impl Editor {
 
     /// カーソル位置に1文字挿入します。
     pub fn insert_char(&mut self, c: char) {
+        self.last_command_was_kill = false;
         let (new_row, new_col) = self.buffer.insert_char(self.cursor_row, self.cursor_col, c);
         self.cursor_row = new_row;
         self.cursor_col = new_col;
@@ -736,6 +769,7 @@ impl Editor {
 
     /// カーソル位置に改行を挿入し、カーソルを次行の先頭へ移動します。
     pub fn insert_newline(&mut self) {
+        self.last_command_was_kill = false;
         let (new_row, new_col) = self.buffer.insert_newline(self.cursor_row, self.cursor_col);
         self.cursor_row = new_row;
         self.cursor_col = new_col;
@@ -744,6 +778,7 @@ impl Editor {
 
     /// カーソル直前の文字を削除（バックスペース）します。
     pub fn delete_backspace(&mut self) {
+        self.last_command_was_kill = false;
         if let Some((new_row, new_col)) = self
             .buffer
             .delete_backspace(self.cursor_row, self.cursor_col)
@@ -756,26 +791,56 @@ impl Editor {
 
     /// カーソル位置の文字を削除（Delete）します。
     pub fn delete_char(&mut self) {
+        self.last_command_was_kill = false;
         self.buffer.delete_char(self.cursor_row, self.cursor_col);
         self.message = None;
     }
 
-    /// カーソル位置から行末までの文字列を削除（Kill line）します。
+    /// テキストをキルリングに追加します。直前の操作がキルの場合は末尾に結合（append）します。
+    fn push_to_kill_ring(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        if self.last_command_was_kill && !self.kill_ring.is_empty() {
+            if let Some(last) = self.kill_ring.last_mut() {
+                last.push_str(&text);
+            }
+        } else {
+            self.kill_ring.push(text);
+        }
+        self.last_command_was_kill = true;
+    }
+
+    /// カーソル位置から行末までの文字列を削除（Kill line）し、キルリングに追加します。
     /// 行末にカーソルがある場合は改行を削除して次行を連結します。
     pub fn kill_line(&mut self) {
         let current_line_len = self.buffer.line_len(self.cursor_row);
         if self.cursor_col >= current_line_len {
-            self.delete_char();
+            let total_lines = self.buffer.len_lines();
+            if self.cursor_row + 1 < total_lines {
+                self.buffer.delete_char(self.cursor_row, self.cursor_col);
+                self.push_to_kill_ring("\n".to_string());
+            }
         } else {
+            let char_idx = self
+                .buffer
+                .point_to_char_idx(self.cursor_row, self.cursor_col);
             let delete_len = current_line_len - self.cursor_col;
+            let killed_text = self
+                .buffer
+                .rope
+                .slice(char_idx..char_idx + delete_len)
+                .to_string();
             self.buffer
                 .delete_range(self.cursor_row, self.cursor_col, delete_len);
+            self.push_to_kill_ring(killed_text);
         }
         self.message = None;
     }
 
     /// 直前の編集操作を取り消します（Undo）。
     pub fn undo(&mut self) {
+        self.last_command_was_kill = false;
         if let Some((new_row, new_col)) = self.buffer.undo() {
             self.cursor_row = new_row;
             self.cursor_col = new_col;
@@ -788,6 +853,7 @@ impl Editor {
 
     /// 取り消した編集操作を再実行します（Redo）。
     pub fn redo(&mut self) {
+        self.last_command_was_kill = false;
         if let Some((new_row, new_col)) = self.buffer.redo() {
             self.cursor_row = new_row;
             self.cursor_col = new_col;
@@ -798,8 +864,142 @@ impl Editor {
         }
     }
 
+    /// 現在のカーソル位置にマークを設定、または既存のマークを解除します（`C-SPC` / `C-@`）。
+    pub fn set_mark_command(&mut self) {
+        self.last_command_was_kill = false;
+        if self.selection.is_some() {
+            self.selection = None;
+            self.message = Some("Mark deactivated".into());
+        } else {
+            self.selection = Some(Selection {
+                mark: (self.cursor_row, self.cursor_col),
+                mode: SelectionMode::Normal,
+            });
+            self.message = Some("Mark set".into());
+        }
+    }
+
+    /// 現在の操作やマーク選択をキャンセルします（`C-g` / `ESC`）。
+    pub fn cancel_current_operation(&mut self) {
+        self.last_command_was_kill = false;
+        self.prefix = PrefixKey::None;
+        let had_selection = self.selection.is_some();
+        self.selection = None;
+        if had_selection {
+            self.message = Some("Quit (Mark deactivated)".into());
+        } else {
+            self.message = Some("Quit".into());
+        }
+    }
+
+    /// 選択範囲のテキストをキルリングにコピーし、マークを解除します（`M-w` / `kill-ring-save`）。
+    pub fn kill_ring_save(&mut self) {
+        if let Some(selection) = self.selection.take() {
+            let text = self
+                .buffer
+                .get_region_text(selection.mark, (self.cursor_row, self.cursor_col));
+            if !text.is_empty() {
+                self.push_to_kill_ring(text);
+                self.message = Some("Copied".into());
+            } else {
+                self.message = Some("Region is empty".into());
+            }
+        } else {
+            self.message = Some("The mark is not set now".into());
+        }
+    }
+
+    /// 選択範囲のテキストをキルリングに保存し、バッファから切り取ります（`C-w` / `kill-region`）。
+    pub fn kill_region(&mut self) {
+        if let Some(selection) = self.selection.take() {
+            let text = self
+                .buffer
+                .get_region_text(selection.mark, (self.cursor_row, self.cursor_col));
+            if !text.is_empty() {
+                self.push_to_kill_ring(text);
+                let (new_row, new_col) = self
+                    .buffer
+                    .delete_region(selection.mark, (self.cursor_row, self.cursor_col));
+                self.cursor_row = new_row;
+                self.cursor_col = new_col;
+                self.clamp_cursor_col();
+                self.message = Some("Cut".into());
+            } else {
+                self.message = Some("Region is empty".into());
+            }
+        } else {
+            self.message = Some("The mark is not set now".into());
+        }
+    }
+
+    /// キルリング内の最新テキストを現在のカーソル位置に貼り付けます（`C-y` / `yank`）。
+    pub fn yank(&mut self) {
+        self.last_command_was_kill = false;
+        if let Some(text) = self.kill_ring.last() {
+            let text_to_insert = text.clone();
+            let (new_row, new_col) =
+                self.buffer
+                    .insert_str(self.cursor_row, self.cursor_col, &text_to_insert);
+            self.cursor_row = new_row;
+            self.cursor_col = new_col;
+            self.selection = None;
+            self.clamp_cursor_col();
+            self.message = None;
+        } else {
+            self.message = Some("Kill ring is empty".into());
+        }
+    }
+
+    /// 指定行において選択範囲（リージョン）に含まれる列インデックス範囲 `(start_col, end_col)` を取得します。
+    pub fn get_selection_range_for_line(&self, line_idx: usize) -> Option<(usize, usize)> {
+        let selection = self.selection.as_ref()?;
+        let (r1, c1) = selection.mark;
+        let (r2, c2) = (self.cursor_row, self.cursor_col);
+
+        match selection.mode {
+            SelectionMode::Normal => {
+                let (start_row, start_col, end_row, end_col) = if (r1, c1) <= (r2, c2) {
+                    (r1, c1, r2, c2)
+                } else {
+                    (r2, c2, r1, c1)
+                };
+
+                if line_idx < start_row || line_idx > end_row {
+                    None
+                } else if line_idx == start_row && line_idx == end_row {
+                    if start_col == end_col {
+                        None
+                    } else {
+                        Some((start_col.min(end_col), start_col.max(end_col)))
+                    }
+                } else if line_idx == start_row {
+                    let line_len = self.buffer.line_len(line_idx);
+                    Some((start_col, line_len.max(start_col)))
+                } else if line_idx == end_row {
+                    Some((0, end_col))
+                } else {
+                    let line_len = self.buffer.line_len(line_idx);
+                    Some((0, line_len))
+                }
+            }
+            SelectionMode::Rectangle => {
+                let min_row = r1.min(r2);
+                let max_row = r1.max(r2);
+                let min_col = c1.min(c2);
+                let max_col = c1.max(c2);
+
+                if line_idx >= min_row && line_idx <= max_row && min_col < max_col {
+                    Some((min_col, max_col))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     /// カーソルを1行上へ移動します。
     pub fn move_up(&mut self) {
+        self.last_command_was_kill = false;
         if self.cursor_row > 0 {
             self.cursor_row -= 1;
             self.clamp_cursor_col();
@@ -809,6 +1009,7 @@ impl Editor {
 
     /// カーソルを1行下へ移動します。
     pub fn move_down(&mut self) {
+        self.last_command_was_kill = false;
         let total_lines = self.buffer.len_lines();
         if self.cursor_row + 1 < total_lines {
             self.cursor_row += 1;
@@ -819,8 +1020,10 @@ impl Editor {
 
     /// カーソルを1文字左へ移動します（行頭の場合は前行の行末へ移動）。
     pub fn move_left(&mut self) {
+        self.last_command_was_kill = false;
         if self.cursor_col > 0 {
             self.cursor_col -= 1;
+            self.clamp_cursor_col();
         } else if self.cursor_row > 0 {
             self.cursor_row -= 1;
             self.cursor_col = self.buffer.line_len(self.cursor_row);
@@ -830,6 +1033,7 @@ impl Editor {
 
     /// カーソルを1文字右へ移動します（行末の場合は次行の行頭へ移動）。
     pub fn move_right(&mut self) {
+        self.last_command_was_kill = false;
         let line_len = self.buffer.line_len(self.cursor_row);
         if self.cursor_col < line_len {
             self.cursor_col += 1;
@@ -842,18 +1046,21 @@ impl Editor {
 
     /// カーソルを現在の行頭へ移動します。
     pub fn move_to_bol(&mut self) {
+        self.last_command_was_kill = false;
         self.cursor_col = 0;
         self.message = None;
     }
 
     /// カーソルを現在の行末へ移動します。
     pub fn move_to_eol(&mut self) {
+        self.last_command_was_kill = false;
         self.cursor_col = self.buffer.line_len(self.cursor_row);
         self.message = None;
     }
 
     /// 1画面分下へスクロールし、カーソルを移動します（Page Down / C-v）。
     pub fn page_down(&mut self) {
+        self.last_command_was_kill = false;
         let step = self.page_height.saturating_sub(2).max(1);
         let total = self.buffer.len_lines();
         if self.cursor_row + step < total {
@@ -867,6 +1074,7 @@ impl Editor {
 
     /// 1画面分上へスクロールし、カーソルを移動します（Page Up / M-v）。
     pub fn page_up(&mut self) {
+        self.last_command_was_kill = false;
         let step = self.page_height.saturating_sub(2).max(1);
         self.cursor_row = self.cursor_row.saturating_sub(step);
         self.clamp_cursor_col();
@@ -940,8 +1148,12 @@ impl Editor {
                 let highlighted_spans =
                     highlight_line(full_line_trimmed, &self.syntax_registry.theme, syntax_opt);
 
+                // 選択範囲（リージョン）ハイライト適用
+                let sel_range = self.get_selection_range_for_line(line_idx);
+                let styled_spans = apply_selection_to_spans(highlighted_spans, sel_range);
+
                 // 横スクロールに応じたスライス
-                let visible_spans = slice_spans(highlighted_spans, self.scroll_col, content_width);
+                let visible_spans = slice_spans(styled_spans, self.scroll_col, content_width);
 
                 let mut line_spans = vec![gutter_span];
                 line_spans.extend(visible_spans);
@@ -972,9 +1184,17 @@ impl Editor {
             })
             .unwrap_or_else(|| "[No Name]".into());
         let mod_flag = if self.buffer.is_modified { " *" } else { "" };
+        let mark_flag = if self.selection.is_some() {
+            " [Mark]"
+        } else {
+            ""
+        };
         let syntax_name = syntax_opt.map(|s| s.name.as_str()).unwrap_or("Plain Text");
 
-        let status_left = format!(" - {}{} [{}]", file_name, mod_flag, syntax_name);
+        let status_left = format!(
+            " - {}{}{}{} [{}]",
+            file_name, mod_flag, mark_flag, "", syntax_name
+        );
         let status_right = format!("Ln {}, Col {} ", self.cursor_row + 1, self.cursor_col + 1);
 
         let pad_len =
@@ -1038,6 +1258,80 @@ impl Editor {
     }
 }
 
+/// 指定した列範囲のSpan群に対して選択範囲（リージョン）の背景色スタイルを合成・適用します。
+fn apply_selection_to_spans<'a>(
+    spans: Vec<Span<'a>>,
+    sel_range: Option<(usize, usize)>,
+) -> Vec<Span<'a>> {
+    let (sel_start, sel_end) = match sel_range {
+        Some((s, e)) if s < e => (s, e),
+        _ => return spans,
+    };
+
+    let mut result = Vec::new();
+    let mut current_col = 0;
+
+    let sel_style_modifier = |mut style: Style| -> Style {
+        style = style
+            .bg(Color::Rgb(50, 75, 110))
+            .add_modifier(Modifier::BOLD);
+        style
+    };
+
+    for span in spans {
+        let span_len = span.content.chars().count();
+        let span_start = current_col;
+        let span_end = current_col + span_len;
+
+        if span_end <= sel_start || span_start >= sel_end {
+            // 選択範囲外
+            result.push(span);
+        } else if span_start >= sel_start && span_end <= sel_end {
+            // 完全に選択範囲内
+            let new_style = sel_style_modifier(span.style);
+            result.push(Span::styled(span.content, new_style));
+        } else {
+            // 部分的に選択範囲と重なる場合、文字ごとに分割
+            let chars: Vec<char> = span.content.chars().collect();
+            let mut part_text = String::new();
+            let mut in_sel = span_start >= sel_start && span_start < sel_end;
+
+            for (idx, ch) in chars.iter().enumerate() {
+                let char_col = span_start + idx;
+                let char_in_sel = char_col >= sel_start && char_col < sel_end;
+
+                if char_in_sel == in_sel {
+                    part_text.push(*ch);
+                } else {
+                    if !part_text.is_empty() {
+                        let style = if in_sel {
+                            sel_style_modifier(span.style)
+                        } else {
+                            span.style
+                        };
+                        result.push(Span::styled(part_text, style));
+                        part_text = String::new();
+                    }
+                    in_sel = char_in_sel;
+                    part_text.push(*ch);
+                }
+            }
+            if !part_text.is_empty() {
+                let style = if in_sel {
+                    sel_style_modifier(span.style)
+                } else {
+                    span.style
+                };
+                result.push(Span::styled(part_text, style));
+            }
+        }
+
+        current_col = span_end;
+    }
+
+    result
+}
+
 /// ハイライト済みSpanのリストを、横スクロールの開始列と表示幅に合わせてスライスします。
 fn slice_spans(spans: Vec<Span<'_>>, start_col: usize, max_len: usize) -> Vec<Span<'static>> {
     let mut result = Vec::new();
@@ -1089,4 +1383,102 @@ fn format_candidates_hint(candidates: &[String], current_idx: usize) -> String {
         candidates.len(),
         parts.join("  ")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kill_line_and_yank() {
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, "Hello World\nLine 2");
+        let mut editor = Editor::new(buf);
+        editor.cursor_row = 0;
+        editor.cursor_col = 6; // At "World"
+
+        editor.kill_line();
+        assert_eq!(editor.buffer.rope.to_string(), "Hello \nLine 2");
+        assert_eq!(editor.kill_ring.last(), Some(&"World".to_string()));
+
+        // Move to line 2 and yank
+        editor.cursor_row = 1;
+        editor.cursor_col = 6;
+        editor.yank();
+        assert_eq!(editor.buffer.rope.to_string(), "Hello \nLine 2World");
+    }
+
+    #[test]
+    fn test_sequential_kill_line_append() {
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, "First\nSecond\nThird");
+        let mut editor = Editor::new(buf);
+        editor.cursor_row = 0;
+        editor.cursor_col = 0;
+
+        // Kill "First"
+        editor.kill_line();
+        assert_eq!(editor.buffer.rope.to_string(), "\nSecond\nThird");
+        // Kill newline
+        editor.kill_line();
+        assert_eq!(editor.buffer.rope.to_string(), "Second\nThird");
+        // Kill "Second"
+        editor.kill_line();
+        assert_eq!(editor.buffer.rope.to_string(), "\nThird");
+
+        // The kill ring should have concatenated "First\nSecond"
+        assert_eq!(editor.kill_ring.last(), Some(&"First\nSecond".to_string()));
+
+        // Yank at bottom
+        editor.cursor_row = 1;
+        editor.cursor_col = 5;
+        editor.yank();
+        assert_eq!(editor.buffer.rope.to_string(), "\nThirdFirst\nSecond");
+    }
+
+    #[test]
+    fn test_kill_region_and_yank() {
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, "Apple Banana Cherry");
+        let mut editor = Editor::new(buf);
+
+        // Mark at "Banana"
+        editor.cursor_row = 0;
+        editor.cursor_col = 6;
+        editor.set_mark_command();
+
+        // Move to after "Banana"
+        editor.cursor_col = 12;
+        editor.kill_region();
+
+        assert_eq!(editor.buffer.rope.to_string(), "Apple  Cherry");
+        assert_eq!(editor.kill_ring.last(), Some(&"Banana".to_string()));
+
+        // Yank back
+        editor.yank();
+        assert_eq!(editor.buffer.rope.to_string(), "Apple Banana Cherry");
+    }
+
+    #[test]
+    fn test_kill_ring_save_and_yank() {
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, "One Two Three");
+        let mut editor = Editor::new(buf);
+
+        // Mark and copy "Two"
+        editor.cursor_row = 0;
+        editor.cursor_col = 4;
+        editor.set_mark_command();
+        editor.cursor_col = 7;
+        editor.kill_ring_save();
+
+        // Buffer shouldn't change on copy
+        assert_eq!(editor.buffer.rope.to_string(), "One Two Three");
+        assert_eq!(editor.kill_ring.last(), Some(&"Two".to_string()));
+
+        // Yank at end
+        editor.cursor_col = 13;
+        editor.yank();
+        assert_eq!(editor.buffer.rope.to_string(), "One Two ThreeTwo");
+    }
 }
