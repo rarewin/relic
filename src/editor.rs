@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::buffer::Buffer;
 use crate::completion::{complete_path, expand_tilde};
+use crate::plugin::PluginEngine;
 use crate::syntax::{SyntaxRegistry, highlight_line};
 
 /// エディタのプレフィックスキー入力状態。
@@ -34,6 +35,8 @@ pub enum PromptType {
     FindFile,
     /// 未保存変更がある場合の終了確認プロンプト
     ConfirmQuit,
+    /// Rhai スクリプト式の評価プロンプト（`Eval Rhai (M-x): `）
+    EvalRhai,
 }
 
 /// ミニバッファでのプロンプト入力状態と補完ステート。
@@ -106,12 +109,28 @@ pub struct Editor {
     pub kill_ring: Vec<String>,
     /// 直前のコマンドがキル操作だったかどうかのフラグ（連続キル時の結合に使用）
     pub last_command_was_kill: bool,
+    /// Rhai プラグイン・スクリプトエンジン
+    pub plugin_engine: PluginEngine,
 }
 
 impl Editor {
-    /// 指定された [`Buffer`] を保持する新しい [`Editor`] インスタンスを初期化します。
+    /// 指定された [`Buffer`] を保持する新しい [`Editor`] インスタンスを初期化し、設定スクリプトが存在する場合はロードします。
     pub fn new(buffer: Buffer) -> Self {
-        Self {
+        let mut plugin_engine = PluginEngine::new();
+        let config_path = PluginEngine::default_config_path();
+
+        let mut init_message = Some(
+            "Welcome to Relic! (C-x C-f: Find, C-x C-s: Save, C-x C-c: Quit, M-x: Eval Rhai)"
+                .into(),
+        );
+
+        if config_path.exists()
+            && let Err(e) = plugin_engine.load_file(&config_path)
+        {
+            init_message = Some(format!("Config error: {}", e));
+        }
+
+        let mut editor = Self {
             buffer,
             cursor_row: 0,
             cursor_col: 0,
@@ -120,14 +139,45 @@ impl Editor {
             page_height: 24,
             prefix: PrefixKey::None,
             prompt: None,
-            message: Some(
-                "Welcome to Relic! (C-x C-f: Find file, C-x C-s: Save, C-x C-w: Write file, C-x C-c: Quit)".into(),
-            ),
+            message: init_message,
             should_quit: false,
             syntax_registry: SyntaxRegistry::new(),
             selection: None,
             kill_ring: Vec::new(),
             last_command_was_kill: false,
+            plugin_engine,
+        };
+
+        editor.apply_script_commands();
+        editor
+    }
+
+    /// エディタの現在のカーソル・行状態を Rhai プラグインエンジンに同期します。
+    pub fn sync_editor_context(&self) {
+        let current_line = if self.cursor_row < self.buffer.len_lines() {
+            let line_rope = self.buffer.rope.line(self.cursor_row);
+            let full_str = line_rope.to_string();
+            full_str.trim_end_matches(['\r', '\n']).to_string()
+        } else {
+            String::new()
+        };
+        self.plugin_engine
+            .update_context(crate::plugin::EditorContext {
+                cursor_row: self.cursor_row,
+                cursor_col: self.cursor_col,
+                current_line,
+                total_lines: self.buffer.len_lines(),
+            });
+    }
+
+    /// スクリプトで定義されたカスタム関数を実行し、エディタ操作を反映します。
+    pub fn execute_script_fn(&mut self, fn_name: &str) {
+        self.last_command_was_kill = false;
+        self.sync_editor_context();
+        if let Err(e) = self.plugin_engine.call_fn(fn_name, ()) {
+            self.message = Some(format!("Error in {}: {}", fn_name, e));
+        } else {
+            self.apply_script_commands();
         }
     }
 
@@ -142,7 +192,16 @@ impl Editor {
             return;
         }
 
-        // 2. Normal Editor key handling
+        // 2. Custom Keybinding check (defined via bind_key / define_key)
+        if let Some(key_str) = key_event_to_string(&self.prefix, &key)
+            && let Some(fn_name) = self.plugin_engine.lookup_keybinding(&key_str)
+        {
+            self.prefix = PrefixKey::None;
+            self.execute_script_fn(&fn_name);
+            return;
+        }
+
+        // 3. Normal Editor key handling
         match self.prefix {
             PrefixKey::None => {
                 // ASCII 0x1F (Unit Separator = Ctrl+/ or Ctrl+_)
@@ -154,6 +213,7 @@ impl Editor {
                 if is_alt {
                     match key.code {
                         KeyCode::Char('w') => self.kill_ring_save(),
+                        KeyCode::Char('x') => self.request_eval_rhai(),
                         KeyCode::Char('v') => self.page_up(),
                         KeyCode::Char('_') | KeyCode::Char('-') => self.redo(),
                         _ => {}
@@ -274,6 +334,7 @@ impl Editor {
                 self.prefix = PrefixKey::None;
                 match key.code {
                     KeyCode::Char('w') => self.kill_ring_save(),
+                    KeyCode::Char('x') => self.request_eval_rhai(),
                     KeyCode::Char('v') => self.page_up(),
                     KeyCode::Char('_') | KeyCode::Char('-') => self.redo(),
                     KeyCode::Char('g') | KeyCode::Esc => self.cancel_current_operation(),
@@ -333,7 +394,7 @@ impl Editor {
                     }
                 }
             }
-            Some(PromptType::SaveAs) | Some(PromptType::FindFile) => {
+            Some(PromptType::SaveAs) | Some(PromptType::FindFile) | Some(PromptType::EvalRhai) => {
                 if is_ctrl {
                     match key.code {
                         KeyCode::Char('g') => {
@@ -632,8 +693,69 @@ impl Editor {
                         }
                     }
                 }
+                PromptType::EvalRhai => {
+                    let trimmed = prompt.input.trim();
+                    if trimmed.is_empty() {
+                        self.message = Some("No expression specified".into());
+                        return;
+                    }
+                    self.sync_editor_context();
+                    let mut scope = rhai::Scope::new();
+                    let res = self
+                        .plugin_engine
+                        .engine
+                        .eval_with_scope::<rhai::Dynamic>(&mut scope, trimmed);
+                    self.apply_script_commands();
+                    match res {
+                        Ok(val) => {
+                            if self.message.is_none() && !val.is_unit() {
+                                self.message = Some(format!("=> {}", val));
+                            }
+                        }
+                        Err(err) => {
+                            self.message = Some(format!("Error: {}", err));
+                        }
+                    }
+                }
                 PromptType::ConfirmOverwrite(_) | PromptType::ConfirmQuit => {}
             }
+        }
+    }
+
+    /// ミニバッファを開いて Rhai スクリプト式の評価（`M-x` / `ESC x`）を要求します。
+    pub fn request_eval_rhai(&mut self) {
+        self.prompt = Some(PromptState {
+            prompt_type: PromptType::EvalRhai,
+            label: "Eval Rhai (M-x): ".into(),
+            input: String::new(),
+            cursor: 0,
+            completions_hint: None,
+            completion_base_dir: None,
+            completion_candidates: Vec::new(),
+            completion_index: None,
+        });
+        self.message = None;
+    }
+
+    /// プラグインエンジンから発行された操作コマンド（メッセージ、テキスト挿入、カーソル移動）をエディタに適用します。
+    pub fn apply_script_commands(&mut self) {
+        let cmds = self.plugin_engine.take_commands();
+        if let Some(msg) = cmds.message {
+            self.message = Some(msg);
+        }
+        for text in cmds.inserts {
+            let (new_row, new_col) =
+                self.buffer
+                    .insert_str(self.cursor_row, self.cursor_col, &text);
+            self.cursor_row = new_row;
+            self.cursor_col = new_col;
+            self.clamp_cursor_col();
+        }
+        if let Some((row, col)) = cmds.cursor_move {
+            let total = self.buffer.len_lines();
+            self.cursor_row = row.min(total.saturating_sub(1));
+            self.cursor_col = col;
+            self.clamp_cursor_col();
         }
     }
 
@@ -1385,6 +1507,55 @@ fn format_candidates_hint(candidates: &[String], current_idx: usize) -> String {
     )
 }
 
+/// キーイベントと現在のプレフィックス状態から、正規化されたキー文字列表現（例: "C-a", "M-x", "C-x C-f"）を取得します。
+pub fn key_event_to_string(prefix: &PrefixKey, key: &KeyEvent) -> Option<String> {
+    let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let is_alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    let key_name = match key.code {
+        KeyCode::Char(' ') if is_ctrl => "C-SPC".to_string(),
+        KeyCode::Char('@') if is_ctrl => "C-@".to_string(),
+        KeyCode::Char('\0') if is_ctrl => "C-SPC".to_string(),
+        KeyCode::Null => "C-SPC".to_string(),
+        KeyCode::Char('/') if is_ctrl => "C-/".to_string(),
+        KeyCode::Char('_') if is_ctrl => "C-_".to_string(),
+        KeyCode::Char(c) => {
+            if is_ctrl {
+                format!("C-{}", c.to_ascii_lowercase())
+            } else if is_alt {
+                format!("M-{}", c.to_ascii_lowercase())
+            } else {
+                c.to_string()
+            }
+        }
+        KeyCode::Enter => "RET".to_string(),
+        KeyCode::Tab => "TAB".to_string(),
+        KeyCode::Backspace => "DEL".to_string(),
+        KeyCode::Esc => "ESC".to_string(),
+        KeyCode::Up => "Up".to_string(),
+        KeyCode::Down => "Down".to_string(),
+        KeyCode::Left => "Left".to_string(),
+        KeyCode::Right => "Right".to_string(),
+        KeyCode::Home => "Home".to_string(),
+        KeyCode::End => "End".to_string(),
+        KeyCode::PageUp => "PageUp".to_string(),
+        KeyCode::PageDown => "PageDown".to_string(),
+        _ => return None,
+    };
+
+    match prefix {
+        PrefixKey::None => Some(key_name),
+        PrefixKey::CtrlX => Some(format!("C-x {}", key_name)),
+        PrefixKey::Meta => {
+            if key_name.starts_with("M-") {
+                Some(key_name)
+            } else {
+                Some(format!("M-{}", key_name))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1480,5 +1651,79 @@ mod tests {
         editor.cursor_col = 13;
         editor.yank();
         assert_eq!(editor.buffer.rope.to_string(), "One Two ThreeTwo");
+    }
+
+    #[test]
+    fn test_eval_rhai_prompt() {
+        let buf = Buffer::new();
+        let mut editor = Editor::new(buf);
+
+        // Open M-x prompt
+        editor.request_eval_rhai();
+        assert!(editor.prompt.is_some());
+
+        // Type: set_message("Hello Rhai!")
+        if let Some(ref mut p) = editor.prompt {
+            p.input = "set_message(\"Hello Rhai!\")".into();
+        }
+
+        // Confirm prompt
+        editor.confirm_prompt();
+        assert_eq!(editor.message, Some("Hello Rhai!".into()));
+
+        // Type expression: 1 + 2 * 3
+        editor.request_eval_rhai();
+        if let Some(ref mut p) = editor.prompt {
+            p.input = "1 + 2 * 3".into();
+        }
+        editor.confirm_prompt();
+        assert_eq!(editor.message, Some("=> 7".into()));
+    }
+
+    #[test]
+    fn test_custom_keybinding_smart_bol() {
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, "    let lovely = 42;");
+        let mut editor = Editor::new(buf);
+
+        // Rhai スクリプトで C-a にスマートBOLを登録
+        let script = r#"
+            fn lovely_bol() {
+                if looking_at("^") {
+                    back_to_indentation();
+                } else {
+                    beginning_of_line();
+                }
+            }
+            define_key("C-a", "lovely_bol");
+        "#;
+        let ast = editor.plugin_engine.engine.compile(script).unwrap();
+        let mut scope = rhai::Scope::new();
+        editor
+            .plugin_engine
+            .engine
+            .run_ast_with_scope(&mut scope, &ast)
+            .unwrap();
+        editor.plugin_engine.ast = Some(ast);
+
+        // 初期位置: 行の途中 (col = 8, 'l' of lovely)
+        editor.cursor_row = 0;
+        editor.cursor_col = 8;
+
+        // 1回目の C-a 押下 -> 行頭 (col = 0) へ移動
+        let key_c_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        editor.handle_key_event(key_c_a);
+        assert_eq!(editor.cursor_row, 0);
+        assert_eq!(editor.cursor_col, 0);
+
+        // 2回目の C-a 押下 -> インデント (col = 4) へ移動
+        editor.handle_key_event(key_c_a);
+        assert_eq!(editor.cursor_row, 0);
+        assert_eq!(editor.cursor_col, 4);
+
+        // 3回目の C-a 押下 -> 再び行頭 (col = 0) へ移動
+        editor.handle_key_event(key_c_a);
+        assert_eq!(editor.cursor_row, 0);
+        assert_eq!(editor.cursor_col, 0);
     }
 }

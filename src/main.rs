@@ -1,6 +1,7 @@
 mod buffer;
 mod completion;
 mod editor;
+mod plugin;
 mod syntax;
 
 use std::env;
