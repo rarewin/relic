@@ -8,7 +8,7 @@ use ratatui::{
 };
 use std::path::{Path, PathBuf};
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, find_matches_in_line};
 use crate::completion::{complete_path, expand_tilde};
 use crate::plugin::PluginEngine;
 use crate::syntax::{SyntaxRegistry, highlight_line};
@@ -37,6 +37,32 @@ pub enum PromptType {
     ConfirmQuit,
     /// Rhai スクリプト式の評価プロンプト（`Eval Rhai (M-x): `）
     EvalRhai,
+    /// インクリメンタル検索プロンプト（`I-search: ` / `I-search backward: `）
+    Search,
+}
+
+/// インクリメンタル検索の方向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchDirection {
+    /// 前方検索（`C-s` / `isearch-forward`）
+    Forward,
+    /// 後方検索（`C-r` / `isearch-backward`）
+    Backward,
+}
+
+/// インクリメンタル検索の実行状態を保持する構造体。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchState {
+    /// 検索開始時のカーソル位置 `(row, col)`（`C-g` キャンセル時の復元用）
+    pub origin_cursor: (usize, usize),
+    /// 検索開始時のスクロール位置 `(scroll_row, scroll_col)`（`C-g` キャンセル時の復元用）
+    pub origin_scroll: (usize, usize),
+    /// 現在の検索方向
+    pub direction: SearchDirection,
+    /// 現在マッチしている位置 `(row, col)`（未マッチ時は `None`）
+    pub current_match: Option<(usize, usize)>,
+    /// バッファ端を越えてラップアラウンド検索が行われたかどうか
+    pub wrapped: bool,
 }
 
 /// ミニバッファでのプロンプト入力状態と補完ステート。
@@ -111,6 +137,10 @@ pub struct Editor {
     pub last_command_was_kill: bool,
     /// Rhai プラグイン・スクリプトエンジン
     pub plugin_engine: PluginEngine,
+    /// インクリメンタル検索の実行状態（検索中のみ `Some`）
+    pub search_state: Option<SearchState>,
+    /// 直前に実行された検索クエリ文字列（`C-s C-s` / `C-r C-r` での再利用に使用）
+    pub last_search_query: Option<String>,
 }
 
 impl Editor {
@@ -146,6 +176,8 @@ impl Editor {
             kill_ring: Vec::new(),
             last_command_was_kill: false,
             plugin_engine,
+            search_state: None,
+            last_search_query: None,
         };
 
         editor.apply_script_commands();
@@ -235,6 +267,10 @@ impl Editor {
                         | KeyCode::Char('_')
                         | KeyCode::Char('7')
                         | KeyCode::Char('\x1f') => self.undo(),
+
+                        // Incremental Search (isearch-forward / isearch-backward)
+                        KeyCode::Char('s') => self.start_search(SearchDirection::Forward),
+                        KeyCode::Char('r') => self.start_search(SearchDirection::Backward),
 
                         // Emacs basic navigation & editing
                         KeyCode::Char('n') => self.move_down(),
@@ -511,6 +547,72 @@ impl Editor {
                     }
                 }
             }
+            Some(PromptType::Search) => {
+                let is_alt = key.modifiers.contains(KeyModifiers::ALT);
+                if is_ctrl {
+                    match key.code {
+                        KeyCode::Char('s') => {
+                            self.repeat_search(SearchDirection::Forward);
+                        }
+                        KeyCode::Char('r') => {
+                            self.repeat_search(SearchDirection::Backward);
+                        }
+                        KeyCode::Char('g') => {
+                            self.cancel_search();
+                        }
+                        KeyCode::Char('h') => {
+                            self.search_backspace();
+                        }
+                        KeyCode::Char('y') => {
+                            if let Some(yanked) = self.kill_ring.last().cloned() {
+                                for ch in yanked.chars() {
+                                    self.prompt_insert_char(ch);
+                                }
+                                let anchor = self
+                                    .search_state
+                                    .as_ref()
+                                    .and_then(|s| s.current_match)
+                                    .or_else(|| self.search_state.as_ref().map(|s| s.origin_cursor))
+                                    .unwrap_or((self.cursor_row, self.cursor_col));
+                                self.update_search_from_anchor(anchor, true);
+                            }
+                        }
+                        _ => {
+                            self.finish_search();
+                            self.handle_key_event(key);
+                        }
+                    }
+                } else if is_alt {
+                    self.finish_search();
+                    self.handle_key_event(key);
+                } else {
+                    match key.code {
+                        KeyCode::Enter => {
+                            self.finish_search();
+                        }
+                        KeyCode::Esc => {
+                            self.cancel_search();
+                        }
+                        KeyCode::Backspace => {
+                            self.search_backspace();
+                        }
+                        KeyCode::Char(c) => {
+                            self.prompt_insert_char(c);
+                            let anchor = self
+                                .search_state
+                                .as_ref()
+                                .and_then(|s| s.current_match)
+                                .or_else(|| self.search_state.as_ref().map(|s| s.origin_cursor))
+                                .unwrap_or((self.cursor_row, self.cursor_col));
+                            self.update_search_from_anchor(anchor, true);
+                        }
+                        _ => {
+                            self.finish_search();
+                            self.handle_key_event(key);
+                        }
+                    }
+                }
+            }
             None => {}
         }
     }
@@ -717,7 +819,7 @@ impl Editor {
                         }
                     }
                 }
-                PromptType::ConfirmOverwrite(_) | PromptType::ConfirmQuit => {}
+                PromptType::ConfirmOverwrite(_) | PromptType::ConfirmQuit | PromptType::Search => {}
             }
         }
     }
@@ -735,6 +837,176 @@ impl Editor {
             completion_index: None,
         });
         self.message = None;
+    }
+
+    /// インクリメンタル検索（`C-s` 前方検索 / `C-r` 後方検索）を開始します。
+    pub fn start_search(&mut self, direction: SearchDirection) {
+        self.last_command_was_kill = false;
+        let origin_cursor = (self.cursor_row, self.cursor_col);
+        let origin_scroll = (self.scroll_row, self.scroll_col);
+
+        self.search_state = Some(SearchState {
+            origin_cursor,
+            origin_scroll,
+            direction,
+            current_match: None,
+            wrapped: false,
+        });
+
+        self.prompt = Some(PromptState {
+            prompt_type: PromptType::Search,
+            label: Self::format_search_label(direction, false, false),
+            input: String::new(),
+            cursor: 0,
+            completions_hint: None,
+            completion_base_dir: None,
+            completion_candidates: Vec::new(),
+            completion_index: None,
+        });
+        self.message = None;
+    }
+
+    /// インクリメンタル検索中に `C-s` または `C-r` が押された際、直前のクエリ復元または次/前のマッチへの移動を行います。
+    pub fn repeat_search(&mut self, direction: SearchDirection) {
+        let input_empty = self
+            .prompt
+            .as_ref()
+            .map(|p| p.input.is_empty())
+            .unwrap_or(true);
+
+        if input_empty && let Some(last_query) = self.last_search_query.clone() {
+            if let Some(ref mut p) = self.prompt {
+                p.input = last_query;
+                p.cursor = p.input.chars().count();
+            }
+            if let Some(ref mut s) = self.search_state {
+                s.direction = direction;
+            }
+            let anchor = self
+                .search_state
+                .as_ref()
+                .and_then(|s| s.current_match)
+                .or_else(|| self.search_state.as_ref().map(|s| s.origin_cursor))
+                .unwrap_or((self.cursor_row, self.cursor_col));
+            self.update_search_from_anchor(anchor, false);
+            return;
+        }
+
+        if let Some(ref mut s) = self.search_state {
+            s.direction = direction;
+        }
+
+        let anchor = self
+            .search_state
+            .as_ref()
+            .and_then(|s| s.current_match)
+            .or_else(|| self.search_state.as_ref().map(|s| s.origin_cursor))
+            .unwrap_or((self.cursor_row, self.cursor_col));
+        self.update_search_from_anchor(anchor, false);
+    }
+
+    /// インクリメンタル検索中にバックスペースで1文字削除し、検索開始位置から再検索します。
+    fn search_backspace(&mut self) {
+        self.prompt_backspace();
+        let origin = self
+            .search_state
+            .as_ref()
+            .map(|s| s.origin_cursor)
+            .unwrap_or((self.cursor_row, self.cursor_col));
+        self.update_search_from_anchor(origin, true);
+    }
+
+    /// 指定した基準位置 `anchor` から現在の検索クエリ・検索方向でバッファを検索し、カーソルとプロンプト表示を更新します。
+    fn update_search_from_anchor(&mut self, anchor: (usize, usize), inclusive: bool) {
+        let query = match self.prompt.as_ref() {
+            Some(p) => p.input.clone(),
+            None => return,
+        };
+        let Some(ref mut state) = self.search_state else {
+            return;
+        };
+        let direction = state.direction;
+
+        if query.is_empty() {
+            let (orig_row, orig_col) = state.origin_cursor;
+            state.current_match = None;
+            state.wrapped = false;
+            self.cursor_row = orig_row;
+            self.cursor_col = orig_col;
+            self.clamp_cursor_col();
+            if let Some(ref mut p) = self.prompt {
+                p.label = Self::format_search_label(direction, false, false);
+            }
+            return;
+        }
+
+        let found = match direction {
+            SearchDirection::Forward => self
+                .buffer
+                .search_forward(&query, anchor.0, anchor.1, inclusive),
+            SearchDirection::Backward => self
+                .buffer
+                .search_backward(&query, anchor.0, anchor.1, inclusive),
+        };
+
+        if let Some(((match_row, match_col), wrapped)) = found {
+            state.current_match = Some((match_row, match_col));
+            if wrapped {
+                state.wrapped = true;
+            }
+            let is_wrapped = state.wrapped;
+            self.cursor_row = match_row;
+            self.cursor_col = match_col;
+            self.clamp_cursor_col();
+            if let Some(ref mut p) = self.prompt {
+                p.label = Self::format_search_label(direction, false, is_wrapped);
+            }
+        } else {
+            state.current_match = None;
+            let is_wrapped = state.wrapped;
+            if let Some(ref mut p) = self.prompt {
+                p.label = Self::format_search_label(direction, true, is_wrapped);
+            }
+        }
+    }
+
+    /// インクリメンタル検索を確定して終了し、カーソルを現在のマッチ位置に残します（`Enter` または移動キー押下時）。
+    pub fn finish_search(&mut self) {
+        if let Some(prompt) = self.prompt.take()
+            && !prompt.input.is_empty()
+        {
+            self.last_search_query = Some(prompt.input);
+        }
+        self.search_state = None;
+        self.message = None;
+    }
+
+    /// インクリメンタル検索をキャンセルし、検索開始前のカーソル位置とスクロール位置を復元します（`C-g` / `ESC`）。
+    pub fn cancel_search(&mut self) {
+        if let Some(state) = self.search_state.take() {
+            self.cursor_row = state.origin_cursor.0;
+            self.cursor_col = state.origin_cursor.1;
+            self.scroll_row = state.origin_scroll.0;
+            self.scroll_col = state.origin_scroll.1;
+            self.clamp_cursor_col();
+        }
+        self.prompt = None;
+        self.message = Some("Quit".into());
+    }
+
+    /// インクリメンタル検索の状態に応じたプロンプトラベル文字列を生成します。
+    fn format_search_label(direction: SearchDirection, failing: bool, wrapped: bool) -> String {
+        let mut prefix = String::new();
+        if failing {
+            prefix.push_str("Failing ");
+        }
+        if wrapped {
+            prefix.push_str("Wrapped ");
+        }
+        match direction {
+            SearchDirection::Forward => format!("{}I-search: ", prefix),
+            SearchDirection::Backward => format!("{}I-search backward: ", prefix),
+        }
     }
 
     /// プラグインエンジンから発行された操作コマンド（メッセージ、テキスト挿入、カーソル移動）をエディタに適用します。
@@ -1254,6 +1526,13 @@ impl Editor {
             .as_ref()
             .and_then(|p| self.syntax_registry.find_syntax_for_file(p));
 
+        let active_search_query = self
+            .prompt
+            .as_ref()
+            .filter(|p| p.prompt_type == PromptType::Search && !p.input.is_empty())
+            .map(|p| p.input.clone());
+        let current_search_match = self.search_state.as_ref().and_then(|s| s.current_match);
+
         // 1. Text Area Rendering
         let mut lines = Vec::new();
         for i in 0..content_height {
@@ -1273,6 +1552,18 @@ impl Editor {
                 // 選択範囲（リージョン）ハイライト適用
                 let sel_range = self.get_selection_range_for_line(line_idx);
                 let styled_spans = apply_selection_to_spans(highlighted_spans, sel_range);
+
+                // インクリメンタル検索マッチのハイライト適用
+                let styled_spans = if let Some(ref query) = active_search_query {
+                    let match_cols = find_matches_in_line(full_line_trimmed, query);
+                    let q_len = query.chars().count();
+                    let active_col = current_search_match
+                        .filter(|&(r, _)| r == line_idx)
+                        .map(|(_, c)| c);
+                    apply_search_matches_to_spans(styled_spans, &match_cols, q_len, active_col)
+                } else {
+                    styled_spans
+                };
 
                 // 横スクロールに応じたスライス
                 let visible_spans = slice_spans(styled_spans, self.scroll_col, content_width);
@@ -1354,10 +1645,27 @@ impl Editor {
             let prompt_widget = Paragraph::new(prompt_line);
             frame.render_widget(prompt_widget, message_area);
 
-            // Cursor in Minibuffer prompt
-            let prompt_cursor_x = message_area.x + prompt.label.len() as u16 + prompt.cursor as u16;
-            if prompt_cursor_x < message_area.x + message_area.width {
-                frame.set_cursor_position(Position::new(prompt_cursor_x, message_area.y));
+            // Cursor positioning:
+            // During Incremental Search (PromptType::Search), keep the terminal cursor in the text buffer
+            // just like Emacs isearch; for other prompts, place it in the minibuffer.
+            if prompt.prompt_type == PromptType::Search {
+                let screen_cursor_x = text_area.x
+                    + gutter_width as u16
+                    + (self.cursor_col.saturating_sub(self.scroll_col) as u16);
+                let screen_cursor_y =
+                    text_area.y + (self.cursor_row.saturating_sub(self.scroll_row) as u16);
+
+                if screen_cursor_x < text_area.x + text_area.width
+                    && screen_cursor_y < text_area.y + text_area.height
+                {
+                    frame.set_cursor_position(Position::new(screen_cursor_x, screen_cursor_y));
+                }
+            } else {
+                let prompt_cursor_x =
+                    message_area.x + prompt.label.len() as u16 + prompt.cursor as u16;
+                if prompt_cursor_x < message_area.x + message_area.width {
+                    frame.set_cursor_position(Position::new(prompt_cursor_x, message_area.y));
+                }
             }
         } else {
             let msg_text = self.message.as_deref().unwrap_or("");
@@ -1449,6 +1757,100 @@ fn apply_selection_to_spans<'a>(
         }
 
         current_col = span_end;
+    }
+
+    result
+}
+
+/// 1行分のSpan群に対して、インクリメンタル検索の一致箇所（現在のマッチおよびその他のマッチ）のハイライトスタイルを適用します。
+fn apply_search_matches_to_spans<'a>(
+    spans: Vec<Span<'a>>,
+    match_cols: &[usize],
+    query_len: usize,
+    active_match_col: Option<usize>,
+) -> Vec<Span<'a>> {
+    if match_cols.is_empty() || query_len == 0 {
+        return spans;
+    }
+
+    // 文字列インデックスごとのマッチ種別 (0: 非マッチ, 1: 通常マッチ, 2: 現在のアクティブマッチ)
+    let total_chars: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if total_chars == 0 {
+        return spans;
+    }
+
+    let mut col_state = vec![0u8; total_chars];
+    for &start_col in match_cols {
+        let is_active = active_match_col == Some(start_col);
+        let state_val = if is_active { 2 } else { 1 };
+        let end_col = (start_col + query_len).min(total_chars);
+        for item in col_state.iter_mut().take(end_col).skip(start_col) {
+            *item = state_val;
+        }
+    }
+
+    let style_for_state = |base_style: Style, state: u8| -> Style {
+        match state {
+            2 => base_style
+                .bg(Color::Rgb(230, 165, 35))
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+            1 => base_style
+                .bg(Color::Rgb(85, 75, 25))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+            _ => base_style,
+        }
+    };
+
+    let mut result = Vec::new();
+    let mut current_col = 0;
+
+    for span in spans {
+        let chars: Vec<char> = span.content.chars().collect();
+        let span_len = chars.len();
+        if span_len == 0 {
+            result.push(span);
+            continue;
+        }
+
+        let first_state = col_state[current_col];
+        let all_same = col_state[current_col..current_col + span_len]
+            .iter()
+            .all(|&st| st == first_state);
+
+        if all_same {
+            let new_style = style_for_state(span.style, first_state);
+            result.push(Span::styled(span.content, new_style));
+        } else {
+            let mut part_text = String::new();
+            let mut cur_state = first_state;
+
+            for (idx, &ch) in chars.iter().enumerate() {
+                let st = col_state[current_col + idx];
+                if st == cur_state {
+                    part_text.push(ch);
+                } else {
+                    if !part_text.is_empty() {
+                        result.push(Span::styled(
+                            part_text,
+                            style_for_state(span.style, cur_state),
+                        ));
+                        part_text = String::new();
+                    }
+                    cur_state = st;
+                    part_text.push(ch);
+                }
+            }
+            if !part_text.is_empty() {
+                result.push(Span::styled(
+                    part_text,
+                    style_for_state(span.style, cur_state),
+                ));
+            }
+        }
+
+        current_col += span_len;
     }
 
     result
@@ -1725,5 +2127,79 @@ mod tests {
         editor.handle_key_event(key_c_a);
         assert_eq!(editor.cursor_row, 0);
         assert_eq!(editor.cursor_col, 0);
+    }
+
+    #[test]
+    fn test_isearch_forward_backward_and_cancel() {
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, "foo bar baz\nbar foo qux\nqux bar foo");
+        let mut editor = Editor::new(buf);
+        editor.cursor_row = 0;
+        editor.cursor_col = 2; // origin at (0, 2)
+
+        let key_c_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        let key_c_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        let key_c_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        let key_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        // 1. C-s で前方インクリメンタル検索を開始
+        editor.handle_key_event(key_c_s);
+        assert_eq!(
+            editor.prompt.as_ref().map(|p| &p.prompt_type),
+            Some(&PromptType::Search)
+        );
+
+        // "bar" と1文字ずつ入力 -> (0, 4) にマッチ
+        for ch in "bar".chars() {
+            editor.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!((editor.cursor_row, editor.cursor_col), (0, 4));
+
+        // もう一度 C-s -> 次の "bar" (1, 0) へ移動
+        editor.handle_key_event(key_c_s);
+        assert_eq!((editor.cursor_row, editor.cursor_col), (1, 0));
+
+        // もう一度 C-s -> 次の "bar" (2, 4) へ移動
+        editor.handle_key_event(key_c_s);
+        assert_eq!((editor.cursor_row, editor.cursor_col), (2, 4));
+
+        // もう一度 C-s -> ラップアラウンドして (0, 4) へ移動
+        editor.handle_key_event(key_c_s);
+        assert_eq!((editor.cursor_row, editor.cursor_col), (0, 4));
+        assert!(
+            editor
+                .prompt
+                .as_ref()
+                .unwrap()
+                .label
+                .starts_with("Wrapped ")
+        );
+
+        // C-r で逆方向検索 -> (2, 4) へ戻る
+        editor.handle_key_event(key_c_r);
+        assert_eq!((editor.cursor_row, editor.cursor_col), (2, 4));
+
+        // C-g でキャンセル -> 検索開始位置 (0, 2) に戻る
+        editor.handle_key_event(key_c_g);
+        assert!(editor.prompt.is_none());
+        assert_eq!((editor.cursor_row, editor.cursor_col), (0, 2));
+
+        // 2. 再度 C-s して "qux" を検索し Enter で確定
+        editor.handle_key_event(key_c_s);
+        for ch in "qux".chars() {
+            editor.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!((editor.cursor_row, editor.cursor_col), (1, 8));
+        editor.handle_key_event(key_enter);
+        assert!(editor.prompt.is_none());
+        assert_eq!((editor.cursor_row, editor.cursor_col), (1, 8));
+        assert_eq!(editor.last_search_query.as_deref(), Some("qux"));
+
+        // 3. C-s C-s で直前のクエリ "qux" を再利用して次のマッチ (2, 0) へ移動
+        editor.handle_key_event(key_c_s);
+        editor.handle_key_event(key_c_s);
+        assert_eq!((editor.cursor_row, editor.cursor_col), (2, 0));
+        editor.handle_key_event(key_enter);
+        assert_eq!((editor.cursor_row, editor.cursor_col), (2, 0));
     }
 }
