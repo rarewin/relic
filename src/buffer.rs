@@ -395,6 +395,330 @@ impl Buffer {
         let col = clamped_idx - line_start;
         (row, col)
     }
+
+    /// 指定した2点間の矩形領域の各行のテキストを取得します。
+    pub fn get_rectangle_text(&self, start: (usize, usize), end: (usize, usize)) -> Vec<String> {
+        let (r1, c1) = start;
+        let (r2, c2) = end;
+        let start_row = r1.min(r2);
+        let end_row = r1.max(r2);
+        let start_col = c1.min(c2);
+        let end_col = c1.max(c2);
+
+        let mut result = Vec::new();
+        let num_lines = self.len_lines();
+
+        for row in start_row..=end_row {
+            if row >= num_lines {
+                result.push(String::new());
+                continue;
+            }
+            let line = self.rope.line(row);
+            let line_len = self.line_len(row);
+            if line_len <= start_col || start_col == end_col {
+                result.push(String::new());
+            } else {
+                let col_end = line_len.min(end_col);
+                let slice = line.slice(start_col..col_end);
+                result.push(slice.to_string());
+            }
+        }
+        result
+    }
+
+    /// 指定した2点間の矩形領域をバッファから削除し、削除後の新しいカーソル位置 `(start_row, start_col)` を返します。
+    pub fn delete_rectangle(
+        &mut self,
+        start: (usize, usize),
+        end: (usize, usize),
+    ) -> (usize, usize) {
+        let (r1, c1) = start;
+        let (r2, c2) = end;
+        let start_row = r1.min(r2);
+        let end_row = r1.max(r2);
+        let start_col = c1.min(c2);
+        let end_col = c1.max(c2);
+
+        let cursor_before = (r2, c2);
+        let cursor_after = (start_row, start_col);
+
+        if start_col == end_col {
+            return cursor_after;
+        }
+
+        let mut actions = Vec::new();
+        let num_lines = self.len_lines();
+        let effective_end_row = end_row.min(num_lines.saturating_sub(1));
+
+        // 下の行から上の行へ降順に処理することでインデックスのずれを防ぐ
+        for row in (start_row..=effective_end_row).rev() {
+            let line_len = self.line_len(row);
+            if line_len > start_col {
+                let col_end = line_len.min(end_col);
+                let delete_len = col_end - start_col;
+                if delete_len > 0 {
+                    let char_idx = self.point_to_char_idx(row, start_col);
+                    let deleted_slice = self.rope.slice(char_idx..char_idx + delete_len);
+                    let deleted_text = deleted_slice.to_string();
+                    self.rope.remove(char_idx..char_idx + delete_len);
+                    actions.push(EditAction::Delete {
+                        char_idx,
+                        text: deleted_text,
+                    });
+                }
+            }
+        }
+
+        if !actions.is_empty() {
+            self.push_undo_group(UndoGroup {
+                actions,
+                cursor_before,
+                cursor_after,
+            });
+        }
+
+        cursor_after
+    }
+
+    /// 指定した2点間の矩形領域の文字を空白スペースに置き換え、
+    /// 置換後の新しいカーソル位置 `(start_row, start_col)` を返します。
+    pub fn clear_rectangle(
+        &mut self,
+        start: (usize, usize),
+        end: (usize, usize),
+    ) -> (usize, usize) {
+        let (r1, c1) = start;
+        let (r2, c2) = end;
+        let start_row = r1.min(r2);
+        let end_row = r1.max(r2);
+        let start_col = c1.min(c2);
+        let end_col = c1.max(c2);
+
+        let cursor_before = (r2, c2);
+        let cursor_after = (start_row, start_col);
+
+        if start_col == end_col {
+            return cursor_after;
+        }
+
+        let mut actions = Vec::new();
+        let num_lines = self.len_lines();
+        let effective_end_row = end_row.min(num_lines.saturating_sub(1));
+
+        for row in (start_row..=effective_end_row).rev() {
+            let line_len = self.line_len(row);
+            if line_len > start_col {
+                let col_end = line_len.min(end_col);
+                let replace_len = col_end - start_col;
+                if replace_len > 0 {
+                    let char_idx = self.point_to_char_idx(row, start_col);
+                    let deleted_slice = self.rope.slice(char_idx..char_idx + replace_len);
+                    let deleted_text = deleted_slice.to_string();
+                    let spaces = " ".repeat(replace_len);
+
+                    self.rope.remove(char_idx..char_idx + replace_len);
+                    self.rope.insert(char_idx, &spaces);
+
+                    actions.push(EditAction::Delete {
+                        char_idx,
+                        text: deleted_text,
+                    });
+                    actions.push(EditAction::Insert {
+                        char_idx,
+                        text: spaces,
+                    });
+                }
+            }
+        }
+
+        if !actions.is_empty() {
+            self.push_undo_group(UndoGroup {
+                actions,
+                cursor_before,
+                cursor_after,
+            });
+        }
+
+        cursor_after
+    }
+
+    /// 指定した2点間の矩形領域を空白スペースで押し広げ、
+    /// 操作後の新しいカーソル位置 `(start_row, start_col)` を返します。
+    pub fn open_rectangle(&mut self, start: (usize, usize), end: (usize, usize)) -> (usize, usize) {
+        let (r1, c1) = start;
+        let (r2, c2) = end;
+        let start_row = r1.min(r2);
+        let end_row = r1.max(r2);
+        let start_col = c1.min(c2);
+        let end_col = c1.max(c2);
+
+        let cursor_before = (r2, c2);
+        let cursor_after = (start_row, start_col);
+
+        let width = end_col - start_col;
+        if width == 0 {
+            return cursor_after;
+        }
+
+        let mut actions = Vec::new();
+        let num_lines = self.len_lines();
+        let effective_end_row = end_row.min(num_lines.saturating_sub(1));
+
+        for row in (start_row..=effective_end_row).rev() {
+            let line_len = self.line_len(row);
+            let (insert_col, spaces_count) = if line_len < start_col {
+                (line_len, (start_col - line_len) + width)
+            } else {
+                (start_col, width)
+            };
+
+            let char_idx = self.point_to_char_idx(row, insert_col);
+            let spaces = " ".repeat(spaces_count);
+            self.rope.insert(char_idx, &spaces);
+            actions.push(EditAction::Insert {
+                char_idx,
+                text: spaces,
+            });
+        }
+
+        if !actions.is_empty() {
+            self.push_undo_group(UndoGroup {
+                actions,
+                cursor_before,
+                cursor_after,
+            });
+        }
+
+        cursor_after
+    }
+
+    /// 指定した2点間の矩形領域を文字列 `text` で置換/挿入し、
+    /// 操作後の新しいカーソル位置 `(start_row, start_col)` を返します。
+    pub fn string_rectangle(
+        &mut self,
+        start: (usize, usize),
+        end: (usize, usize),
+        text: &str,
+    ) -> (usize, usize) {
+        let (r1, c1) = start;
+        let (r2, c2) = end;
+        let start_row = r1.min(r2);
+        let end_row = r1.max(r2);
+        let start_col = c1.min(c2);
+        let end_col = c1.max(c2);
+
+        let cursor_before = (r2, c2);
+        let cursor_after = (start_row, start_col);
+
+        let mut actions = Vec::new();
+        let num_lines = self.len_lines();
+        let effective_end_row = end_row.min(num_lines.saturating_sub(1));
+
+        for row in (start_row..=effective_end_row).rev() {
+            let line_len = self.line_len(row);
+            if line_len < start_col {
+                let padding = " ".repeat(start_col - line_len);
+                let to_insert = format!("{}{}", padding, text);
+                let char_idx = self.point_to_char_idx(row, line_len);
+                self.rope.insert(char_idx, &to_insert);
+                actions.push(EditAction::Insert {
+                    char_idx,
+                    text: to_insert,
+                });
+            } else {
+                let col_end = line_len.min(end_col);
+                let delete_len = col_end - start_col;
+                let char_idx = self.point_to_char_idx(row, start_col);
+
+                if delete_len > 0 {
+                    let deleted_slice = self.rope.slice(char_idx..char_idx + delete_len);
+                    let deleted_text = deleted_slice.to_string();
+                    self.rope.remove(char_idx..char_idx + delete_len);
+                    actions.push(EditAction::Delete {
+                        char_idx,
+                        text: deleted_text,
+                    });
+                }
+
+                if !text.is_empty() {
+                    self.rope.insert(char_idx, text);
+                    actions.push(EditAction::Insert {
+                        char_idx,
+                        text: text.to_string(),
+                    });
+                }
+            }
+        }
+
+        if !actions.is_empty() {
+            self.push_undo_group(UndoGroup {
+                actions,
+                cursor_before,
+                cursor_after,
+            });
+        }
+
+        cursor_after
+    }
+
+    /// カーソル位置 `point` を左上として矩形 `rect` を貼り付け（ヤンク）、
+    /// 貼り付け後の新しいカーソル位置を返します。
+    pub fn yank_rectangle(&mut self, point: (usize, usize), rect: &[String]) -> (usize, usize) {
+        if rect.is_empty() {
+            return point;
+        }
+
+        let (start_row, start_col) = point;
+        let cursor_before = point;
+        let width = rect.first().map(|s| s.chars().count()).unwrap_or(0);
+        let cursor_after = (start_row, start_col + width);
+
+        let mut actions = Vec::new();
+        let needed_lines = start_row + rect.len();
+
+        // 不足している行があれば改行を追加
+        while self.len_lines() < needed_lines {
+            let char_idx = self.rope.len_chars();
+            self.rope.insert_char(char_idx, '\n');
+            actions.push(EditAction::Insert {
+                char_idx,
+                text: "\n".to_string(),
+            });
+        }
+
+        // 下の行から上の行へ降順に各行のテキストを挿入
+        for (i, line_str) in rect.iter().enumerate().rev() {
+            let row = start_row + i;
+            let line_len = self.line_len(row);
+
+            let (char_idx, text_to_insert) = if line_len < start_col {
+                let padding = " ".repeat(start_col - line_len);
+                let idx = self.point_to_char_idx(row, line_len);
+                (idx, format!("{}{}", padding, line_str))
+            } else {
+                let idx = self.point_to_char_idx(row, start_col);
+                (idx, line_str.clone())
+            };
+
+            if !text_to_insert.is_empty() {
+                self.rope.insert(char_idx, &text_to_insert);
+                actions.push(EditAction::Insert {
+                    char_idx,
+                    text: text_to_insert,
+                });
+            }
+        }
+
+        if !actions.is_empty() {
+            self.push_undo_group(UndoGroup {
+                actions,
+                cursor_before,
+                cursor_after,
+            });
+        }
+
+        cursor_after
+    }
 }
 
 #[cfg(test)]
@@ -499,5 +823,104 @@ mod tests {
         let pos = buf.undo();
         assert_eq!(pos, Some((0, 0)));
         assert_eq!(buf.rope.to_string(), "");
+    }
+
+    #[test]
+    fn test_rectangle_get_and_delete_undo_redo() {
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, "12345\nabcde\n67890");
+
+        // (0, 1) から (2, 4) の矩形テキストを取得: "234", "bcd", "789"
+        let text = buf.get_rectangle_text((0, 1), (2, 4));
+        assert_eq!(text, vec!["234", "bcd", "789"]);
+
+        // 矩形削除
+        let pos = buf.delete_rectangle((0, 1), (2, 4));
+        assert_eq!(pos, (0, 1));
+        assert_eq!(buf.rope.to_string(), "15\nae\n60");
+
+        // Undo
+        let undo_pos = buf.undo();
+        assert_eq!(undo_pos, Some((2, 4)));
+        assert_eq!(buf.rope.to_string(), "12345\nabcde\n67890");
+
+        // Redo
+        let redo_pos = buf.redo();
+        assert_eq!(redo_pos, Some((0, 1)));
+        assert_eq!(buf.rope.to_string(), "15\nae\n60");
+    }
+
+    #[test]
+    fn test_rectangle_clear_undo_redo() {
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, "12345\nabcde\n67890");
+
+        let pos = buf.clear_rectangle((0, 1), (2, 4));
+        assert_eq!(pos, (0, 1));
+        assert_eq!(buf.rope.to_string(), "1   5\na   e\n6   0");
+
+        let undo_pos = buf.undo();
+        assert_eq!(undo_pos, Some((2, 4)));
+        assert_eq!(buf.rope.to_string(), "12345\nabcde\n67890");
+
+        let redo_pos = buf.redo();
+        assert_eq!(redo_pos, Some((0, 1)));
+        assert_eq!(buf.rope.to_string(), "1   5\na   e\n6   0");
+    }
+
+    #[test]
+    fn test_rectangle_open_undo_redo() {
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, "123\nabc\n678");
+
+        // 幅 2 のスペースを挿入
+        let pos = buf.open_rectangle((0, 1), (2, 3));
+        assert_eq!(pos, (0, 1));
+        assert_eq!(buf.rope.to_string(), "1  23\na  bc\n6  78");
+
+        let undo_pos = buf.undo();
+        assert_eq!(undo_pos, Some((2, 3)));
+        assert_eq!(buf.rope.to_string(), "123\nabc\n678");
+
+        let redo_pos = buf.redo();
+        assert_eq!(redo_pos, Some((0, 1)));
+        assert_eq!(buf.rope.to_string(), "1  23\na  bc\n6  78");
+    }
+
+    #[test]
+    fn test_rectangle_string_undo_redo() {
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, "12345\nabcde\n67890");
+
+        let pos = buf.string_rectangle((0, 1), (2, 4), "XYZ");
+        assert_eq!(pos, (0, 1));
+        assert_eq!(buf.rope.to_string(), "1XYZ5\naXYZe\n6XYZ0");
+
+        let undo_pos = buf.undo();
+        assert_eq!(undo_pos, Some((2, 4)));
+        assert_eq!(buf.rope.to_string(), "12345\nabcde\n67890");
+
+        let redo_pos = buf.redo();
+        assert_eq!(redo_pos, Some((0, 1)));
+        assert_eq!(buf.rope.to_string(), "1XYZ5\naXYZe\n6XYZ0");
+    }
+
+    #[test]
+    fn test_rectangle_yank_undo_redo() {
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, "15\nae\n60");
+
+        let rect = vec!["234".to_string(), "bcd".to_string(), "789".to_string()];
+        let pos = buf.yank_rectangle((0, 1), &rect);
+        assert_eq!(pos, (0, 4));
+        assert_eq!(buf.rope.to_string(), "12345\nabcde\n67890");
+
+        let undo_pos = buf.undo();
+        assert_eq!(undo_pos, Some((0, 1)));
+        assert_eq!(buf.rope.to_string(), "15\nae\n60");
+
+        let redo_pos = buf.redo();
+        assert_eq!(redo_pos, Some((0, 4)));
+        assert_eq!(buf.rope.to_string(), "12345\nabcde\n67890");
     }
 }
