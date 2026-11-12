@@ -568,12 +568,7 @@ impl Editor {
                                 for ch in yanked.chars() {
                                     self.prompt_insert_char(ch);
                                 }
-                                let anchor = self
-                                    .search_state
-                                    .as_ref()
-                                    .and_then(|s| s.current_match)
-                                    .or_else(|| self.search_state.as_ref().map(|s| s.origin_cursor))
-                                    .unwrap_or((self.cursor_row, self.cursor_col));
+                                let anchor = self.current_search_anchor();
                                 self.update_search_from_anchor(anchor, true);
                             }
                         }
@@ -598,12 +593,7 @@ impl Editor {
                         }
                         KeyCode::Char(c) => {
                             self.prompt_insert_char(c);
-                            let anchor = self
-                                .search_state
-                                .as_ref()
-                                .and_then(|s| s.current_match)
-                                .or_else(|| self.search_state.as_ref().map(|s| s.origin_cursor))
-                                .unwrap_or((self.cursor_row, self.cursor_col));
+                            let anchor = self.current_search_anchor();
                             self.update_search_from_anchor(anchor, true);
                         }
                         _ => {
@@ -882,12 +872,7 @@ impl Editor {
             if let Some(ref mut s) = self.search_state {
                 s.direction = direction;
             }
-            let anchor = self
-                .search_state
-                .as_ref()
-                .and_then(|s| s.current_match)
-                .or_else(|| self.search_state.as_ref().map(|s| s.origin_cursor))
-                .unwrap_or((self.cursor_row, self.cursor_col));
+            let anchor = self.current_search_anchor();
             self.update_search_from_anchor(anchor, false);
             return;
         }
@@ -896,13 +881,17 @@ impl Editor {
             s.direction = direction;
         }
 
-        let anchor = self
-            .search_state
+        let anchor = self.current_search_anchor();
+        self.update_search_from_anchor(anchor, false);
+    }
+
+    /// インクリメンタル検索の起点となる現在アンカー位置 `(row, col)` を取得します。
+    fn current_search_anchor(&self) -> (usize, usize) {
+        self.search_state
             .as_ref()
             .and_then(|s| s.current_match)
             .or_else(|| self.search_state.as_ref().map(|s| s.origin_cursor))
-            .unwrap_or((self.cursor_row, self.cursor_col));
-        self.update_search_from_anchor(anchor, false);
+            .unwrap_or((self.cursor_row, self.cursor_col))
     }
 
     /// インクリメンタル検索中にバックスペースで1文字削除し、検索開始位置から再検索します。
@@ -949,14 +938,14 @@ impl Editor {
                 .search_backward(&query, anchor.0, anchor.1, inclusive),
         };
 
-        if let Some(((match_row, match_col), wrapped)) = found {
-            state.current_match = Some((match_row, match_col));
-            if wrapped {
+        if let Some(res) = found {
+            state.current_match = Some(res.pos);
+            if res.wrapped {
                 state.wrapped = true;
             }
             let is_wrapped = state.wrapped;
-            self.cursor_row = match_row;
-            self.cursor_col = match_col;
+            self.cursor_row = res.pos.0;
+            self.cursor_col = res.pos.1;
             self.clamp_cursor_col();
             if let Some(ref mut p) = self.prompt {
                 p.label = Self::format_search_label(direction, false, is_wrapped);
@@ -1785,7 +1774,9 @@ fn apply_search_matches_to_spans<'a>(
         let state_val = if is_active { 2 } else { 1 };
         let end_col = (start_col + query_len).min(total_chars);
         for item in col_state.iter_mut().take(end_col).skip(start_col) {
-            *item = state_val;
+            if is_active || *item == 0 {
+                *item = state_val;
+            }
         }
     }
 
@@ -2201,5 +2192,22 @@ mod tests {
         assert_eq!((editor.cursor_row, editor.cursor_col), (2, 0));
         editor.handle_key_event(key_enter);
         assert_eq!((editor.cursor_row, editor.cursor_col), (2, 0));
+    }
+
+    #[test]
+    fn test_apply_search_matches_overlapping_active_highlight() {
+        // "aaaa" に対して "aa" を検索する場合、マッチ位置は 0, 1, 2
+        // アクティブマッチが 0 のとき、後続の 1 や 2 によって 0 のスタイルが通常マッチに上書きされないことを確認
+        let spans = vec![Span::raw("aaaa")];
+        let match_cols = vec![0, 1, 2];
+        let result = apply_search_matches_to_spans(spans, &match_cols, 2, Some(0));
+
+        // インデックス 0, 1 はアクティブマッチ (state 2: bg Rgb(230, 165, 35))
+        // インデックス 2, 3 は通常マッチ (state 1: bg Rgb(85, 75, 25))
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].content, "aa");
+        assert_eq!(result[0].style.bg, Some(Color::Rgb(230, 165, 35)));
+        assert_eq!(result[1].content, "aa");
+        assert_eq!(result[1].style.bg, Some(Color::Rgb(85, 75, 25)));
     }
 }
