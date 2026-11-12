@@ -397,6 +397,200 @@ impl Buffer {
     }
 }
 
+/// 検索の一致結果を表す構造体。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchResult {
+    /// マッチした位置の行・列座標 `(row, col)`（0-indexed, 文字単位）
+    pub pos: (usize, usize),
+    /// バッファ端を越えて折り返し（ラップアラウンド）検索が行われたかどうか
+    pub wrapped: bool,
+}
+
+impl Buffer {
+    /// 指定した行の文字列（末尾の改行コードを除いたもの）を取得します。
+    pub fn line_trimmed_string(&self, line_idx: usize) -> String {
+        if line_idx >= self.rope.len_lines() {
+            return String::new();
+        }
+        let full_str = self.rope.line(line_idx).to_string();
+        full_str.trim_end_matches(['\r', '\n']).to_string()
+    }
+
+    /// 指定した開始座標 `(start_row, start_col)` から順方向（前方から末尾へ）に `query` を検索します。
+    ///
+    /// - `inclusive` が `true` の場合、`start_col` 自体から始まるマッチも含めます。
+    /// - `inclusive` が `false` の場合、`start_col` より後ろから始まるマッチを検索します。
+    /// - 末尾まで見つからない場合はファイル先頭へ折り返して検索し、`wrapped: true` の [`SearchResult`] を返します。
+    pub fn search_forward(
+        &self,
+        query: &str,
+        start_row: usize,
+        start_col: usize,
+        inclusive: bool,
+    ) -> Option<SearchResult> {
+        if query.is_empty() {
+            return None;
+        }
+        let total_lines = self.len_lines();
+        if total_lines == 0 {
+            return None;
+        }
+        let start_row = start_row.min(total_lines - 1);
+        let query_chars: Vec<char> = query.chars().collect();
+        let case_sensitive = query_chars.iter().any(|c| c.is_uppercase());
+
+        // 1. 現在位置からバッファ末尾まで検索
+        for row in start_row..total_lines {
+            let line_str = self.line_trimmed_string(row);
+            let matches = find_matches_in_line_with_chars(&line_str, &query_chars, case_sensitive);
+            for col in matches {
+                if row > start_row
+                    || (inclusive && col >= start_col)
+                    || (!inclusive && col > start_col)
+                {
+                    return Some(SearchResult {
+                        pos: (row, col),
+                        wrapped: false,
+                    });
+                }
+            }
+        }
+
+        // 2. バッファ先頭から現在位置まで折り返し（ラップアラウンド）検索
+        for row in 0..=start_row {
+            let line_str = self.line_trimmed_string(row);
+            let matches = find_matches_in_line_with_chars(&line_str, &query_chars, case_sensitive);
+            for col in matches {
+                if row < start_row
+                    || (inclusive && col < start_col)
+                    || (!inclusive && col <= start_col)
+                {
+                    return Some(SearchResult {
+                        pos: (row, col),
+                        wrapped: true,
+                    });
+                }
+            }
+        }
+
+        None
+    }
+
+    /// 指定した開始座標 `(start_row, start_col)` から逆方向（後方から先頭へ）に `query` を検索します。
+    ///
+    /// - `inclusive` が `true` の場合、`start_col` 自体から始まるマッチも含めます。
+    /// - `inclusive` が `false` の場合、`start_col` より前から始まるマッチを検索します。
+    /// - 先頭まで見つからない場合はファイル末尾へ折り返して検索し、`wrapped: true` の [`SearchResult`] を返します。
+    pub fn search_backward(
+        &self,
+        query: &str,
+        start_row: usize,
+        start_col: usize,
+        inclusive: bool,
+    ) -> Option<SearchResult> {
+        if query.is_empty() {
+            return None;
+        }
+        let total_lines = self.len_lines();
+        if total_lines == 0 {
+            return None;
+        }
+        let start_row = start_row.min(total_lines - 1);
+        let query_chars: Vec<char> = query.chars().collect();
+        let case_sensitive = query_chars.iter().any(|c| c.is_uppercase());
+
+        // 1. 現在位置からバッファ先頭まで逆順検索
+        for row in (0..=start_row).rev() {
+            let line_str = self.line_trimmed_string(row);
+            let matches = find_matches_in_line_with_chars(&line_str, &query_chars, case_sensitive);
+            for col in matches.into_iter().rev() {
+                if row < start_row
+                    || (inclusive && col <= start_col)
+                    || (!inclusive && col < start_col)
+                {
+                    return Some(SearchResult {
+                        pos: (row, col),
+                        wrapped: false,
+                    });
+                }
+            }
+        }
+
+        // 2. バッファ末尾から現在位置まで折り返し（ラップアラウンド）逆順検索
+        for row in (start_row..total_lines).rev() {
+            let line_str = self.line_trimmed_string(row);
+            let matches = find_matches_in_line_with_chars(&line_str, &query_chars, case_sensitive);
+            for col in matches.into_iter().rev() {
+                if row > start_row
+                    || (inclusive && col > start_col)
+                    || (!inclusive && col >= start_col)
+                {
+                    return Some(SearchResult {
+                        pos: (row, col),
+                        wrapped: true,
+                    });
+                }
+            }
+        }
+
+        None
+    }
+}
+
+/// 2つの文字が一致するかを判定します（`case_sensitive` が `false` の場合は大文字・小文字を区別しません）。
+#[inline]
+fn chars_match(a: char, b: char, case_sensitive: bool) -> bool {
+    if case_sensitive {
+        a == b
+    } else if a.is_ascii() && b.is_ascii() {
+        a.eq_ignore_ascii_case(&b)
+    } else {
+        a.to_lowercase().eq(b.to_lowercase())
+    }
+}
+
+/// 指定した1行の文字列（改行除く）から、事前収集した検索クエリ文字群に一致するすべての開始列インデックス（文字単位）を返します。
+pub fn find_matches_in_line_with_chars(
+    line: &str,
+    query_chars: &[char],
+    case_sensitive: bool,
+) -> Vec<usize> {
+    if query_chars.is_empty() {
+        return Vec::new();
+    }
+    let line_chars: Vec<char> = line.chars().collect();
+    let q_len = query_chars.len();
+    if q_len > line_chars.len() {
+        return Vec::new();
+    }
+
+    let mut matches = Vec::new();
+
+    for start_col in 0..=(line_chars.len() - q_len) {
+        let mut matched = true;
+        for i in 0..q_len {
+            if !chars_match(line_chars[start_col + i], query_chars[i], case_sensitive) {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            matches.push(start_col);
+        }
+    }
+
+    matches
+}
+
+/// 指定した1行の文字列（改行除く）から、検索クエリに一致するすべての開始列インデックス（文字単位）を返します。
+///
+/// クエリに大文字が含まれる場合は大文字・小文字を区別し、すべて小文字の場合は区別しないスマートケース検索を行います。
+pub fn find_matches_in_line(line: &str, query: &str) -> Vec<usize> {
+    let query_chars: Vec<char> = query.chars().collect();
+    let case_sensitive = query_chars.iter().any(|c| c.is_uppercase());
+    find_matches_in_line_with_chars(line, &query_chars, case_sensitive)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,5 +693,77 @@ mod tests {
         let pos = buf.undo();
         assert_eq!(pos, Some((0, 0)));
         assert_eq!(buf.rope.to_string(), "");
+    }
+
+    #[test]
+    fn test_find_matches_in_line_smart_case_and_unicode() {
+        // 小文字クエリは大文字・小文字を区別しない (Smart-case)
+        assert_eq!(
+            find_matches_in_line("Hello hello HELLO", "hello"),
+            vec![0, 6, 12]
+        );
+        // 大文字を含むクエリは大文字・小文字を区別する
+        assert_eq!(find_matches_in_line("Hello hello HELLO", "Hello"), vec![0]);
+        // 日本語（マルチバイトUTF-8）でも文字インデックスで返る
+        assert_eq!(
+            find_matches_in_line("あいうえお_あい_かきく", "あい"),
+            vec![0, 6]
+        );
+    }
+
+    #[test]
+    fn test_search_forward_and_backward() {
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, "apple banana\ncherry apple\nbanana date");
+
+        // (0, 0) から "apple" を inclusive=true で前方検索 -> (0, 0)
+        assert_eq!(
+            buf.search_forward("apple", 0, 0, true),
+            Some(SearchResult {
+                pos: (0, 0),
+                wrapped: false
+            })
+        );
+        // (0, 0) から "apple" を inclusive=false で前方検索 -> 次の行の (1, 7)
+        assert_eq!(
+            buf.search_forward("apple", 0, 0, false),
+            Some(SearchResult {
+                pos: (1, 7),
+                wrapped: false
+            })
+        );
+        // (1, 7) から "apple" を inclusive=false で前方検索 -> ラップアラウンドして (0, 0)
+        assert_eq!(
+            buf.search_forward("apple", 1, 7, false),
+            Some(SearchResult {
+                pos: (0, 0),
+                wrapped: true
+            })
+        );
+
+        // (2, 10) から "banana" を inclusive=true で後方検索 -> (2, 0)
+        assert_eq!(
+            buf.search_backward("banana", 2, 10, true),
+            Some(SearchResult {
+                pos: (2, 0),
+                wrapped: false
+            })
+        );
+        // (2, 0) から "banana" を inclusive=false で後方検索 -> (0, 6)
+        assert_eq!(
+            buf.search_backward("banana", 2, 0, false),
+            Some(SearchResult {
+                pos: (0, 6),
+                wrapped: false
+            })
+        );
+        // (0, 6) から "banana" を inclusive=false で後方検索 -> ラップアラウンドして (2, 0)
+        assert_eq!(
+            buf.search_backward("banana", 0, 6, false),
+            Some(SearchResult {
+                pos: (2, 0),
+                wrapped: true
+            })
+        );
     }
 }
