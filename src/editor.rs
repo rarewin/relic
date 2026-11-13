@@ -20,6 +20,8 @@ pub enum PrefixKey {
     None,
     /// `Ctrl+x` が押された後の状態
     CtrlX,
+    /// `Ctrl+x r` が押された後の状態（矩形編集プレフィックス）
+    CtrlXR,
     /// `Esc` (Meta) が押された後の状態
     Meta,
 }
@@ -37,6 +39,11 @@ pub enum PromptType {
     ConfirmQuit,
     /// Rhai スクリプト式の評価プロンプト（`Eval Rhai (M-x): `）
     EvalRhai,
+    /// 矩形領域文字列置換プロンプト（`String rectangle: `）
+    StringRectangle {
+        start: (usize, usize),
+        end: (usize, usize),
+    },
 }
 
 /// ミニバッファでのプロンプト入力状態と補完ステート。
@@ -107,6 +114,8 @@ pub struct Editor {
     pub selection: Option<Selection>,
     /// コピー・カットされたテキストを保持するキルリング
     pub kill_ring: Vec<String>,
+    /// コピー・カットされた矩形テキストを保持する矩形キルリング
+    pub killed_rectangle: Option<Vec<String>>,
     /// 直前のコマンドがキル操作だったかどうかのフラグ（連続キル時の結合に使用）
     pub last_command_was_kill: bool,
     /// Rhai プラグイン・スクリプトエンジン
@@ -144,6 +153,7 @@ impl Editor {
             syntax_registry: SyntaxRegistry::new(),
             selection: None,
             kill_ring: Vec::new(),
+            killed_rectangle: None,
             last_command_was_kill: false,
             plugin_engine,
         };
@@ -317,10 +327,50 @@ impl Editor {
                         KeyCode::Char('w') => self.request_write_file(),
                         KeyCode::Char('u') => self.undo(),
                         KeyCode::Char('c') => self.request_quit(),
+                        KeyCode::Char('r') => {
+                            self.prefix = PrefixKey::CtrlXR;
+                            self.message = Some("C-x r".into());
+                        }
                         KeyCode::Char('g') | KeyCode::Esc => self.cancel_current_operation(),
                         _ => {
                             self.message = Some(format!(
                                 "C-x {} is undefined",
+                                match key.code {
+                                    KeyCode::Char(c) => c.to_string(),
+                                    _ => "?".into(),
+                                }
+                            ));
+                        }
+                    }
+                }
+            }
+            PrefixKey::CtrlXR => {
+                self.prefix = PrefixKey::None;
+                if is_ctrl {
+                    match key.code {
+                        KeyCode::Char('g') => self.cancel_current_operation(),
+                        _ => {
+                            self.message = Some(format!(
+                                "C-x r C-{} is undefined",
+                                match key.code {
+                                    KeyCode::Char(c) => c.to_string(),
+                                    _ => "?".into(),
+                                }
+                            ));
+                        }
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Char('k') => self.kill_rectangle(),
+                        KeyCode::Char('y') => self.yank_rectangle(),
+                        KeyCode::Char('d') => self.delete_rectangle(),
+                        KeyCode::Char('c') => self.clear_rectangle(),
+                        KeyCode::Char('o') => self.open_rectangle(),
+                        KeyCode::Char('t') => self.request_string_rectangle(),
+                        KeyCode::Char('g') | KeyCode::Esc => self.cancel_current_operation(),
+                        _ => {
+                            self.message = Some(format!(
+                                "C-x r {} is undefined",
                                 match key.code {
                                     KeyCode::Char(c) => c.to_string(),
                                     _ => "?".into(),
@@ -394,7 +444,10 @@ impl Editor {
                     }
                 }
             }
-            Some(PromptType::SaveAs) | Some(PromptType::FindFile) | Some(PromptType::EvalRhai) => {
+            Some(PromptType::SaveAs)
+            | Some(PromptType::FindFile)
+            | Some(PromptType::EvalRhai)
+            | Some(PromptType::StringRectangle { .. }) => {
                 if is_ctrl {
                     match key.code {
                         KeyCode::Char('g') => {
@@ -716,6 +769,15 @@ impl Editor {
                             self.message = Some(format!("Error: {}", err));
                         }
                     }
+                }
+                PromptType::StringRectangle { start, end } => {
+                    let (new_row, new_col) =
+                        self.buffer.string_rectangle(start, end, &prompt.input);
+                    self.cursor_row = new_row;
+                    self.cursor_col = new_col;
+                    self.selection = None;
+                    self.clamp_cursor_col();
+                    self.message = None;
                 }
                 PromptType::ConfirmOverwrite(_) | PromptType::ConfirmQuit => {}
             }
@@ -1069,6 +1131,110 @@ impl Editor {
             self.message = None;
         } else {
             self.message = Some("Kill ring is empty".into());
+        }
+    }
+
+    /// 選択範囲（矩形領域）を切り取って矩形キルリングに保存します（`C-x r k` / `kill-rectangle`）。
+    pub fn kill_rectangle(&mut self) {
+        self.last_command_was_kill = false;
+        if let Some(selection) = self.selection.take() {
+            let start = selection.mark;
+            let end = (self.cursor_row, self.cursor_col);
+            let text = self.buffer.get_rectangle_text(start, end);
+            self.killed_rectangle = Some(text);
+            let (new_row, new_col) = self.buffer.delete_rectangle(start, end);
+            self.cursor_row = new_row;
+            self.cursor_col = new_col;
+            self.clamp_cursor_col();
+            self.message = None;
+        } else {
+            self.message = Some("The mark is not set now".into());
+        }
+    }
+
+    /// 選択範囲（矩形領域）を保存せずに削除します（`C-x r d` / `delete-rectangle`）。
+    pub fn delete_rectangle(&mut self) {
+        self.last_command_was_kill = false;
+        if let Some(selection) = self.selection.take() {
+            let start = selection.mark;
+            let end = (self.cursor_row, self.cursor_col);
+            let (new_row, new_col) = self.buffer.delete_rectangle(start, end);
+            self.cursor_row = new_row;
+            self.cursor_col = new_col;
+            self.clamp_cursor_col();
+            self.message = None;
+        } else {
+            self.message = Some("The mark is not set now".into());
+        }
+    }
+
+    /// 選択範囲（矩形領域）の文字を空白スペースに置き換えます（`C-x r c` / `clear-rectangle`）。
+    pub fn clear_rectangle(&mut self) {
+        self.last_command_was_kill = false;
+        if let Some(selection) = self.selection.take() {
+            let start = selection.mark;
+            let end = (self.cursor_row, self.cursor_col);
+            let (new_row, new_col) = self.buffer.clear_rectangle(start, end);
+            self.cursor_row = new_row;
+            self.cursor_col = new_col;
+            self.clamp_cursor_col();
+            self.message = None;
+        } else {
+            self.message = Some("The mark is not set now".into());
+        }
+    }
+
+    /// 選択範囲（矩形領域）を空白スペースで押し広げます（`C-x r o` / `open-rectangle`）。
+    pub fn open_rectangle(&mut self) {
+        self.last_command_was_kill = false;
+        if let Some(selection) = self.selection.take() {
+            let start = selection.mark;
+            let end = (self.cursor_row, self.cursor_col);
+            let (new_row, new_col) = self.buffer.open_rectangle(start, end);
+            self.cursor_row = new_row;
+            self.cursor_col = new_col;
+            self.clamp_cursor_col();
+            self.message = None;
+        } else {
+            self.message = Some("The mark is not set now".into());
+        }
+    }
+
+    /// 直前に保存された矩形をカーソル位置を左上として貼り付けます（`C-x r y` / `yank-rectangle`）。
+    pub fn yank_rectangle(&mut self) {
+        self.last_command_was_kill = false;
+        if let Some(ref rect) = self.killed_rectangle {
+            let (new_row, new_col) = self
+                .buffer
+                .yank_rectangle((self.cursor_row, self.cursor_col), rect);
+            self.cursor_row = new_row;
+            self.cursor_col = new_col;
+            self.selection = None;
+            self.clamp_cursor_col();
+            self.message = None;
+        } else {
+            self.message = Some("No killed rectangle".into());
+        }
+    }
+
+    /// ミニバッファプロンプトを開いて矩形領域の文字列置換（`C-x r t` / `string-rectangle`）を要求します。
+    pub fn request_string_rectangle(&mut self) {
+        if let Some(selection) = self.selection.take() {
+            let start = selection.mark;
+            let end = (self.cursor_row, self.cursor_col);
+            self.prompt = Some(PromptState {
+                prompt_type: PromptType::StringRectangle { start, end },
+                label: "String rectangle: ".to_string(),
+                input: String::new(),
+                cursor: 0,
+                completions_hint: None,
+                completion_base_dir: None,
+                completion_candidates: Vec::new(),
+                completion_index: None,
+            });
+            self.message = None;
+        } else {
+            self.message = Some("The mark is not set now".into());
         }
     }
 
@@ -1546,6 +1712,7 @@ pub fn key_event_to_string(prefix: &PrefixKey, key: &KeyEvent) -> Option<String>
     match prefix {
         PrefixKey::None => Some(key_name),
         PrefixKey::CtrlX => Some(format!("C-x {}", key_name)),
+        PrefixKey::CtrlXR => Some(format!("C-x r {}", key_name)),
         PrefixKey::Meta => {
             if key_name.starts_with("M-") {
                 Some(key_name)
@@ -1678,6 +1845,119 @@ mod tests {
         }
         editor.confirm_prompt();
         assert_eq!(editor.message, Some("=> 7".into()));
+    }
+
+    #[test]
+    fn test_kill_rectangle_and_yank_rectangle() {
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, "12345\nabcde\n67890");
+        let mut editor = Editor::new(buf);
+
+        // Mark at (0, 1)
+        editor.cursor_row = 0;
+        editor.cursor_col = 1;
+        editor.set_mark_command();
+
+        // Move to (2, 4)
+        editor.cursor_row = 2;
+        editor.cursor_col = 4;
+
+        // C-x r k (kill-rectangle)
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+
+        assert_eq!(editor.buffer.rope.to_string(), "15\nae\n60");
+        assert_eq!(
+            editor.killed_rectangle,
+            Some(vec!["234".into(), "bcd".into(), "789".into()])
+        );
+        assert_eq!(editor.cursor_row, 0);
+        assert_eq!(editor.cursor_col, 1);
+        assert!(editor.selection.is_none());
+
+        // Move to (0, 2) and C-x r y (yank-rectangle)
+        editor.cursor_col = 2;
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        assert_eq!(editor.buffer.rope.to_string(), "15234\naebcd\n60789");
+    }
+
+    #[test]
+    fn test_delete_clear_open_rectangle() {
+        // delete-rectangle (C-x r d)
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, "12345\nabcde\n67890");
+        let mut editor = Editor::new(buf);
+
+        editor.cursor_row = 0;
+        editor.cursor_col = 1;
+        editor.set_mark_command();
+        editor.cursor_row = 2;
+        editor.cursor_col = 4;
+
+        editor.delete_rectangle();
+        assert_eq!(editor.buffer.rope.to_string(), "15\nae\n60");
+        assert_eq!(editor.killed_rectangle, None); // Should not save to kill ring
+
+        // clear-rectangle (C-x r c)
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, "12345\nabcde\n67890");
+        let mut editor = Editor::new(buf);
+
+        editor.cursor_row = 0;
+        editor.cursor_col = 1;
+        editor.set_mark_command();
+        editor.cursor_row = 2;
+        editor.cursor_col = 4;
+
+        editor.clear_rectangle();
+        assert_eq!(editor.buffer.rope.to_string(), "1   5\na   e\n6   0");
+
+        // open-rectangle (C-x r o)
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, "12345\nabcde\n67890");
+        let mut editor = Editor::new(buf);
+
+        editor.cursor_row = 0;
+        editor.cursor_col = 1;
+        editor.set_mark_command();
+        editor.cursor_row = 2;
+        editor.cursor_col = 3;
+
+        editor.open_rectangle();
+        assert_eq!(editor.buffer.rope.to_string(), "1  2345\na  bcde\n6  7890");
+    }
+
+    #[test]
+    fn test_string_rectangle_prompt() {
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, "12345\nabcde\n67890");
+        let mut editor = Editor::new(buf);
+
+        // Mark (0, 1) to (2, 4)
+        editor.cursor_row = 0;
+        editor.cursor_col = 1;
+        editor.set_mark_command();
+        editor.cursor_row = 2;
+        editor.cursor_col = 4;
+
+        // C-x r t
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+
+        assert!(editor.prompt.is_some());
+        if let Some(ref mut p) = editor.prompt {
+            p.input = "XYZ".into();
+        }
+
+        // Press Enter
+        editor.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(editor.prompt.is_none());
+        assert_eq!(editor.buffer.rope.to_string(), "1XYZ5\naXYZe\n6XYZ0");
     }
 
     #[test]
