@@ -670,7 +670,7 @@ impl Buffer {
 
         let (start_row, start_col) = point;
         let cursor_before = point;
-        let width = rect.first().map(|s| s.chars().count()).unwrap_or(0);
+        let width = rect.iter().map(|s| s.chars().count()).max().unwrap_or(0);
         let cursor_after = (start_row, start_col + width);
 
         let mut actions = Vec::new();
@@ -1187,5 +1187,12 @@ mod tests {
         let redo_pos = buf.redo();
         assert_eq!(redo_pos, Some((0, 4)));
         assert_eq!(buf.rope.to_string(), "12345\nabcde\n67890");
+
+        // 先頭行が空文字列の変形矩形データでも最大行長でカーソル列が計算されることの確認
+        let mut buf2 = Buffer::new();
+        buf2.insert_str(0, 0, "12\n34");
+        let non_uniform_rect = vec!["".to_string(), "ABC".to_string()];
+        let pos2 = buf2.yank_rectangle((0, 1), &non_uniform_rect);
+        assert_eq!(pos2, (0, 4)); // 1 + max(0, 3) = 4
     }
 }
