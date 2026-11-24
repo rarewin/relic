@@ -33,6 +33,7 @@
 | **`C-e`** / `End` | `move-end-of-line` | 行末へ移動 |
 | **`C-v`** / `PageDown` | `scroll-up-command` | 1画面分下へスクロール |
 | **`M-v`** (`Alt+v` / `Esc v`) / `PageUp` | `scroll-down-command` | 1画面分上へスクロール |
+| **`C-l`** | `recenter-top-bottom` | カーソル行を画面中央・最上部・最下部へ順繰りに再配置 |
 
 ### 検索（Incremental Search）
 | キー | コマンド | 説明 |

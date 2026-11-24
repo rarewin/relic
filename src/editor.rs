@@ -112,6 +112,17 @@ pub struct Selection {
     pub mode: SelectionMode,
 }
 
+/// `recenter-top-bottom` (`C-l`) による画面内配置位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecenterPosition {
+    /// 画面中央
+    Center,
+    /// 画面最上部
+    Top,
+    /// 画面最下部
+    Bottom,
+}
+
 /// テキストエディタの全体状態を管理するメイン構造体。
 pub struct Editor {
     /// 編集中のテキストバッファ
@@ -144,6 +155,8 @@ pub struct Editor {
     pub killed_rectangle: Option<Vec<String>>,
     /// 直前のコマンドがキル操作だったかどうかのフラグ（連続キル時の結合に使用）
     pub last_command_was_kill: bool,
+    /// 直前の recenter-top-bottom (`C-l`) コマンドで設定された配置位置（連続実行時のサイクル判定用）
+    pub last_recenter_position: Option<RecenterPosition>,
     /// Rhai プラグイン・スクリプトエンジン
     pub plugin_engine: PluginEngine,
     /// インクリメンタル検索の実行状態（検索中のみ `Some`）
@@ -185,6 +198,7 @@ impl Editor {
             kill_ring: Vec::new(),
             killed_rectangle: None,
             last_command_was_kill: false,
+            last_recenter_position: None,
             plugin_engine,
             search_state: None,
             last_search_query: None,
@@ -227,6 +241,16 @@ impl Editor {
     pub fn handle_key_event(&mut self, key: KeyEvent) {
         let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let is_alt = key.modifiers.contains(KeyModifiers::ALT);
+
+        // C-l 以外のキー入力時は recenter サイクルをリセット
+        let is_recenter = self.prompt.is_none()
+            && self.prefix == PrefixKey::None
+            && is_ctrl
+            && !is_alt
+            && key.code == KeyCode::Char('l');
+        if !is_recenter {
+            self.last_recenter_position = None;
+        }
 
         // 1. If currently inside a Minibuffer prompt
         if self.prompt.is_some() {
@@ -289,6 +313,7 @@ impl Editor {
                         KeyCode::Char('b') => self.move_left(),
                         KeyCode::Char('a') => self.move_to_bol(),
                         KeyCode::Char('e') => self.move_to_eol(),
+                        KeyCode::Char('l') => self.recenter_top_bottom(),
                         KeyCode::Char('v') => self.page_down(),
                         KeyCode::Char('d') => self.delete_char(),
                         KeyCode::Char('h') => self.delete_backspace(),
@@ -1206,6 +1231,7 @@ impl Editor {
     /// カーソル位置に1文字挿入します。
     pub fn insert_char(&mut self, c: char) {
         self.last_command_was_kill = false;
+        self.last_recenter_position = None;
         let (new_row, new_col) = self.buffer.insert_char(self.cursor_row, self.cursor_col, c);
         self.cursor_row = new_row;
         self.cursor_col = new_col;
@@ -1215,6 +1241,7 @@ impl Editor {
     /// カーソル位置に改行を挿入し、カーソルを次行の先頭へ移動します。
     pub fn insert_newline(&mut self) {
         self.last_command_was_kill = false;
+        self.last_recenter_position = None;
         let (new_row, new_col) = self.buffer.insert_newline(self.cursor_row, self.cursor_col);
         self.cursor_row = new_row;
         self.cursor_col = new_col;
@@ -1224,6 +1251,7 @@ impl Editor {
     /// カーソル直前の文字を削除（バックスペース）します。
     pub fn delete_backspace(&mut self) {
         self.last_command_was_kill = false;
+        self.last_recenter_position = None;
         if let Some((new_row, new_col)) = self
             .buffer
             .delete_backspace(self.cursor_row, self.cursor_col)
@@ -1237,6 +1265,7 @@ impl Editor {
     /// カーソル位置の文字を削除（Delete）します。
     pub fn delete_char(&mut self) {
         self.last_command_was_kill = false;
+        self.last_recenter_position = None;
         self.buffer.delete_char(self.cursor_row, self.cursor_col);
         self.message = None;
     }
@@ -1549,6 +1578,7 @@ impl Editor {
     /// カーソルを1行上へ移動します。
     pub fn move_up(&mut self) {
         self.last_command_was_kill = false;
+        self.last_recenter_position = None;
         if self.cursor_row > 0 {
             self.cursor_row -= 1;
             self.clamp_cursor_col();
@@ -1559,6 +1589,7 @@ impl Editor {
     /// カーソルを1行下へ移動します。
     pub fn move_down(&mut self) {
         self.last_command_was_kill = false;
+        self.last_recenter_position = None;
         let total_lines = self.buffer.len_lines();
         if self.cursor_row + 1 < total_lines {
             self.cursor_row += 1;
@@ -1570,6 +1601,7 @@ impl Editor {
     /// カーソルを1文字左へ移動します（行頭の場合は前行の行末へ移動）。
     pub fn move_left(&mut self) {
         self.last_command_was_kill = false;
+        self.last_recenter_position = None;
         if self.cursor_col > 0 {
             self.cursor_col -= 1;
             self.clamp_cursor_col();
@@ -1583,6 +1615,7 @@ impl Editor {
     /// カーソルを1文字右へ移動します（行末の場合は次行の行頭へ移動）。
     pub fn move_right(&mut self) {
         self.last_command_was_kill = false;
+        self.last_recenter_position = None;
         let line_len = self.buffer.line_len(self.cursor_row);
         if self.cursor_col < line_len {
             self.cursor_col += 1;
@@ -1596,6 +1629,7 @@ impl Editor {
     /// カーソルを現在の行頭へ移動します。
     pub fn move_to_bol(&mut self) {
         self.last_command_was_kill = false;
+        self.last_recenter_position = None;
         self.cursor_col = 0;
         self.message = None;
     }
@@ -1603,6 +1637,7 @@ impl Editor {
     /// カーソルを現在の行末へ移動します。
     pub fn move_to_eol(&mut self) {
         self.last_command_was_kill = false;
+        self.last_recenter_position = None;
         self.cursor_col = self.buffer.line_len(self.cursor_row);
         self.message = None;
     }
@@ -1610,6 +1645,7 @@ impl Editor {
     /// 1画面分下へスクロールし、カーソルを移動します（Page Down / C-v）。
     pub fn page_down(&mut self) {
         self.last_command_was_kill = false;
+        self.last_recenter_position = None;
         let step = self.page_height.saturating_sub(2).max(1);
         let total = self.buffer.len_lines();
         if self.cursor_row + step < total {
@@ -1624,9 +1660,36 @@ impl Editor {
     /// 1画面分上へスクロールし、カーソルを移動します（Page Up / M-v）。
     pub fn page_up(&mut self) {
         self.last_command_was_kill = false;
+        self.last_recenter_position = None;
         let step = self.page_height.saturating_sub(2).max(1);
         self.cursor_row = self.cursor_row.saturating_sub(step);
         self.clamp_cursor_col();
+        self.message = None;
+    }
+
+    /// カーソル行を画面中央、最上部、最下部へ順繰りに再配置します（`C-l` / `recenter-top-bottom`）。
+    pub fn recenter_top_bottom(&mut self) {
+        self.last_command_was_kill = false;
+
+        let next_pos = match self.last_recenter_position {
+            None | Some(RecenterPosition::Bottom) => RecenterPosition::Center,
+            Some(RecenterPosition::Center) => RecenterPosition::Top,
+            Some(RecenterPosition::Top) => RecenterPosition::Bottom,
+        };
+        self.last_recenter_position = Some(next_pos);
+
+        let height = self.page_height.max(1);
+        let target_scroll = match next_pos {
+            RecenterPosition::Center => self.cursor_row.saturating_sub(height / 2),
+            RecenterPosition::Top => self.cursor_row,
+            RecenterPosition::Bottom => self.cursor_row.saturating_sub(height.saturating_sub(1)),
+        };
+
+        let total_lines = self.buffer.len_lines();
+        let max_scroll = total_lines.saturating_sub(1);
+        let min_scroll = self.cursor_row.saturating_sub(height.saturating_sub(1));
+        let max_scroll_for_cursor = self.cursor_row.min(max_scroll);
+        self.scroll_row = target_scroll.clamp(min_scroll, max_scroll_for_cursor);
         self.message = None;
     }
 
@@ -2489,5 +2552,147 @@ mod tests {
         assert_eq!(result[0].style.bg, Some(Color::Rgb(230, 165, 35)));
         assert_eq!(result[1].content, "aa");
         assert_eq!(result[1].style.bg, Some(Color::Rgb(85, 75, 25)));
+    }
+
+    #[test]
+    fn test_recenter_top_bottom_cycle() {
+        let mut lines = Vec::new();
+        for i in 0..50 {
+            lines.push(format!("line {}", i));
+        }
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, &lines.join("\n"));
+
+        let mut editor = Editor::new(buf);
+        editor.page_height = 10;
+        editor.cursor_row = 20;
+        editor.scroll_row = 0;
+
+        let key_c_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+
+        // 1回目: Center (cursor_row - 10 / 2 = 15)
+        editor.handle_key_event(key_c_l);
+        assert_eq!(editor.scroll_row, 15);
+        assert_eq!(editor.last_recenter_position, Some(RecenterPosition::Center));
+
+        // 2回目: Top (cursor_row = 20)
+        editor.handle_key_event(key_c_l);
+        assert_eq!(editor.scroll_row, 20);
+        assert_eq!(editor.last_recenter_position, Some(RecenterPosition::Top));
+
+        // 3回目: Bottom (cursor_row - (10 - 1) = 11)
+        editor.handle_key_event(key_c_l);
+        assert_eq!(editor.scroll_row, 11);
+        assert_eq!(editor.last_recenter_position, Some(RecenterPosition::Bottom));
+
+        // 4回目: 再び Center (15) に循環
+        editor.handle_key_event(key_c_l);
+        assert_eq!(editor.scroll_row, 15);
+        assert_eq!(editor.last_recenter_position, Some(RecenterPosition::Center));
+
+        // 5回目: Top (20)
+        editor.handle_key_event(key_c_l);
+        assert_eq!(editor.scroll_row, 20);
+        assert_eq!(editor.last_recenter_position, Some(RecenterPosition::Top));
+
+        // 6回目: Bottom (11)
+        editor.handle_key_event(key_c_l);
+        assert_eq!(editor.scroll_row, 11);
+        assert_eq!(editor.last_recenter_position, Some(RecenterPosition::Bottom));
+    }
+
+    #[test]
+    fn test_recenter_reset_by_other_keys() {
+        let mut lines = Vec::new();
+        for i in 0..50 {
+            lines.push(format!("line {}", i));
+        }
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, &lines.join("\n"));
+
+        let mut editor = Editor::new(buf);
+        editor.page_height = 10;
+        editor.cursor_row = 20;
+
+        let key_c_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        let key_c_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        let key_char = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+
+        // 1. C-l 1回目 -> Center
+        editor.handle_key_event(key_c_l);
+        assert_eq!(editor.scroll_row, 15);
+        assert_eq!(editor.last_recenter_position, Some(RecenterPosition::Center));
+
+        // 2. C-l 2回目 -> Top
+        editor.handle_key_event(key_c_l);
+        assert_eq!(editor.scroll_row, 20);
+        assert_eq!(editor.last_recenter_position, Some(RecenterPosition::Top));
+
+        // 3. 別のキー (C-n) を挟む -> カーソルが 21 行目になり、サイクルがリセットされる
+        editor.handle_key_event(key_c_n);
+        assert_eq!(editor.cursor_row, 21);
+        assert_eq!(editor.last_recenter_position, None);
+
+        // 4. 次の C-l はリセットされているため、Bottom ではなく再び Center (21 - 5 = 16) から始まる
+        editor.handle_key_event(key_c_l);
+        assert_eq!(editor.scroll_row, 16);
+        assert_eq!(editor.last_recenter_position, Some(RecenterPosition::Center));
+
+        // 5. 文字入力を挟む -> 再びサイクルがリセットされる
+        editor.handle_key_event(key_char);
+        assert_eq!(editor.last_recenter_position, None);
+
+        // 6. 次の C-l は再び Center (16) から始まる
+        editor.handle_key_event(key_c_l);
+        assert_eq!(editor.scroll_row, 16);
+        assert_eq!(editor.last_recenter_position, Some(RecenterPosition::Center));
+    }
+
+    #[test]
+    fn test_recenter_clamp_boundaries() {
+        // 先頭付近でのクランプ検証
+        let mut lines = Vec::new();
+        for i in 0..50 {
+            lines.push(format!("line {}", i));
+        }
+        let mut buf = Buffer::new();
+        buf.insert_str(0, 0, &lines.join("\n"));
+
+        let mut editor = Editor::new(buf);
+        editor.page_height = 10;
+        editor.cursor_row = 2;
+
+        let key_c_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+
+        // Center: 2 - 5 -> 0 未満にはならず 0 にクランプ
+        editor.handle_key_event(key_c_l);
+        assert_eq!(editor.scroll_row, 0);
+
+        // Top: cursor_row = 2
+        editor.handle_key_event(key_c_l);
+        assert_eq!(editor.scroll_row, 2);
+
+        // Bottom: 2 - 9 -> 0 にクランプ
+        editor.handle_key_event(key_c_l);
+        assert_eq!(editor.scroll_row, 0);
+
+        // バッファ行数が短い場合のクランプ検証
+        let mut short_buf = Buffer::new();
+        short_buf.insert_str(0, 0, "1\n2\n3\n4\n5");
+        let mut short_editor = Editor::new(short_buf);
+        short_editor.page_height = 10;
+        short_editor.cursor_row = 4; // 最終行
+
+        // Center: 4 - 5 -> 0
+        short_editor.handle_key_event(key_c_l);
+        assert_eq!(short_editor.scroll_row, 0);
+
+        // Top: cursor_row = 4 (バッファ末尾行を超えないようクランプされる)
+        short_editor.handle_key_event(key_c_l);
+        assert_eq!(short_editor.scroll_row, 4);
+
+        // Bottom: 4 - 9 -> 0
+        short_editor.handle_key_event(key_c_l);
+        assert_eq!(short_editor.scroll_row, 0);
     }
 }
