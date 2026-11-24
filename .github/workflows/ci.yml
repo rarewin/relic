@@ -20,6 +20,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Check dependencies and licenses (cargo-deny)
+        uses: EmbarkStudios/cargo-deny-action@v2
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
