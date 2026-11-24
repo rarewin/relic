@@ -2573,7 +2573,10 @@ mod tests {
         // 1回目: Center (cursor_row - 10 / 2 = 15)
         editor.handle_key_event(key_c_l);
         assert_eq!(editor.scroll_row, 15);
-        assert_eq!(editor.last_recenter_position, Some(RecenterPosition::Center));
+        assert_eq!(
+            editor.last_recenter_position,
+            Some(RecenterPosition::Center)
+        );
 
         // 2回目: Top (cursor_row = 20)
         editor.handle_key_event(key_c_l);
@@ -2583,12 +2586,18 @@ mod tests {
         // 3回目: Bottom (cursor_row - (10 - 1) = 11)
         editor.handle_key_event(key_c_l);
         assert_eq!(editor.scroll_row, 11);
-        assert_eq!(editor.last_recenter_position, Some(RecenterPosition::Bottom));
+        assert_eq!(
+            editor.last_recenter_position,
+            Some(RecenterPosition::Bottom)
+        );
 
         // 4回目: 再び Center (15) に循環
         editor.handle_key_event(key_c_l);
         assert_eq!(editor.scroll_row, 15);
-        assert_eq!(editor.last_recenter_position, Some(RecenterPosition::Center));
+        assert_eq!(
+            editor.last_recenter_position,
+            Some(RecenterPosition::Center)
+        );
 
         // 5回目: Top (20)
         editor.handle_key_event(key_c_l);
@@ -2598,7 +2607,10 @@ mod tests {
         // 6回目: Bottom (11)
         editor.handle_key_event(key_c_l);
         assert_eq!(editor.scroll_row, 11);
-        assert_eq!(editor.last_recenter_position, Some(RecenterPosition::Bottom));
+        assert_eq!(
+            editor.last_recenter_position,
+            Some(RecenterPosition::Bottom)
+        );
     }
 
     #[test]
@@ -2621,7 +2633,10 @@ mod tests {
         // 1. C-l 1回目 -> Center
         editor.handle_key_event(key_c_l);
         assert_eq!(editor.scroll_row, 15);
-        assert_eq!(editor.last_recenter_position, Some(RecenterPosition::Center));
+        assert_eq!(
+            editor.last_recenter_position,
+            Some(RecenterPosition::Center)
+        );
 
         // 2. C-l 2回目 -> Top
         editor.handle_key_event(key_c_l);
@@ -2636,7 +2651,10 @@ mod tests {
         // 4. 次の C-l はリセットされているため、Bottom ではなく再び Center (21 - 5 = 16) から始まる
         editor.handle_key_event(key_c_l);
         assert_eq!(editor.scroll_row, 16);
-        assert_eq!(editor.last_recenter_position, Some(RecenterPosition::Center));
+        assert_eq!(
+            editor.last_recenter_position,
+            Some(RecenterPosition::Center)
+        );
 
         // 5. 文字入力を挟む -> 再びサイクルがリセットされる
         editor.handle_key_event(key_char);
@@ -2645,7 +2663,10 @@ mod tests {
         // 6. 次の C-l は再び Center (16) から始まる
         editor.handle_key_event(key_c_l);
         assert_eq!(editor.scroll_row, 16);
-        assert_eq!(editor.last_recenter_position, Some(RecenterPosition::Center));
+        assert_eq!(
+            editor.last_recenter_position,
+            Some(RecenterPosition::Center)
+        );
     }
 
     #[test]
